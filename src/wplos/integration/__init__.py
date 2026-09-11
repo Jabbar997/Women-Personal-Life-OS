@@ -22,12 +22,14 @@ from wplos.integration.specs import (
 from wplos.integration.store import (
     ALLOWED_FROM,
     ActionStatus,
+    IdempotencyConflict,
     IllegalTransition,
     OutboxEvent,
     OutboxState,
     ProjectionState,
     SQLiteIntegrationStore,
     StoredAction,
+    idempotency_fingerprint,
 )
 
 __all__ = [
@@ -40,6 +42,7 @@ __all__ = [
     "EventSpec",
     "ExecutionMode",
     "ExternalProvider",
+    "IdempotencyConflict",
     "IllegalTransition",
     "IntegrationEventType",
     "LookupOutcome",
@@ -56,4 +59,5 @@ __all__ = [
     "SQLiteIntegrationStore",
     "StoredAction",
     "WalkingSkeleton",
+    "idempotency_fingerprint",
 ]

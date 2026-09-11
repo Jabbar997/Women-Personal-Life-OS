@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
@@ -82,6 +83,52 @@ class IllegalTransition(RuntimeError):
     """A status change the state machine does not permit, or lost to a racer."""
 
 
+class IdempotencyConflict(RuntimeError):
+    """A client request id was reused for a different command.
+
+    Returning the first operation would execute something the caller did not
+    ask for the second time, under a key that says the two are the same.
+    """
+
+
+def idempotency_fingerprint(action: ProposedAction, *, spec_name: str, projection_id: str) -> str:
+    """A digest of the logical command behind a request.
+
+    Everything here can change what the operation *is*: who it belongs to, what
+    it acts on, what authority it needs, and the terms it carries.
+
+    Four things are deliberately left out. ``action_id``, ``proposed_at``,
+    ``correlation_id``, ``command_id`` and ``external_reference`` are generated
+    per attempt, so including them would make every retry a different command —
+    which is the opposite of an idempotency key. ``offer_expires_at`` is derived
+    from server time at the moment the offer is built, so two retries seconds
+    apart would collide on it. ``summary`` is display text describing the
+    operation rather than defining it.
+
+    ``parameters`` *is* included. Consent deliberately ignores it (ADR-006: an
+    incidental retry counter must not revoke an authorization), but request
+    identity is a different question from consent, and a request that differs
+    at all is better refused than silently answered with an earlier one.
+    """
+    canonical = json.dumps(
+        {
+            "owner_id": str(action.owner_id),
+            "spec_name": spec_name,
+            "projection_id": projection_id,
+            "domain": str(action.domain),
+            "permission_level": str(action.permission_level),
+            "reversibility": str(action.reversibility),
+            "target_entity_id": action.target_entity_id,
+            "material_terms": action.material_terms,
+            "parameters": action.parameters,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class OutboxState(StrEnum):
     PENDING = "PENDING"
     PARKED_FOR_GAP = "PARKED_FOR_GAP"
@@ -103,6 +150,8 @@ class StoredAction:
     command_id: str
     external_reference: str
     reauthorization_expires_at: datetime | None
+    idempotency_fingerprint: str = ""
+    processing_deadline: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +237,9 @@ class SQLiteIntegrationStore:
                     command_id TEXT NOT NULL,
                     external_reference TEXT NOT NULL,
                     reauthorization_expires_at TEXT,
+                    idempotency_fingerprint TEXT NOT NULL,
+                    processing_claimed_at TEXT,
+                    processing_deadline TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(user_id, client_request_id)
@@ -286,6 +338,9 @@ class SQLiteIntegrationStore:
         outbox event with it.
         """
         now = _now_iso()
+        fingerprint = idempotency_fingerprint(
+            action, spec_name=spec_name, projection_id=projection_id
+        )
         duplicate = False
         with self.transaction() as connection:
             cursor = connection.execute(
@@ -293,8 +348,8 @@ class SQLiteIntegrationStore:
                 INSERT INTO actions(
                     action_id,user_id,client_request_id,status,spec_name,projection_id,
                     proposed_action_json,authorization_json,correlation_id,command_id,
-                    external_reference,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    external_reference,idempotency_fingerprint,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(user_id, client_request_id) DO NOTHING
                 """,
                 (
@@ -309,6 +364,7 @@ class SQLiteIntegrationStore:
                     correlation_id,
                     command_id,
                     external_reference,
+                    fingerprint,
                     now,
                     now,
                 ),
@@ -346,6 +402,10 @@ class SQLiteIntegrationStore:
             existing = self.get_by_client_request(str(action.owner_id), client_request_id)
             if existing is None:
                 raise RuntimeError("conflicting request vanished before it could be read")
+            if existing.idempotency_fingerprint != fingerprint:
+                raise IdempotencyConflict(
+                    f"client request {client_request_id} was already used for a different command"
+                )
             return existing, False
         stored = self.get_action(str(action.action_id))
         if stored is None:
@@ -414,15 +474,48 @@ class SQLiteIntegrationStore:
                 ),
             )
 
-    def claim_for_processing(self, action_id: str) -> bool:
+    def claim_for_processing(self, action_id: str, *, now: datetime, lease: timedelta) -> bool:
         """Take exclusive ownership of an action, or lose the race.
 
         A conditional UPDATE inside BEGIN IMMEDIATE is the whole mechanism: two
         workers both reach here, both attempt it, and exactly one changes a row.
         Nothing here depends on a process-level lock, so it still holds when the
         workers are separate processes or separate machines.
+
+        The claim carries a deadline so that a worker which dies mid-flight
+        leaves something recoverable rather than an action stuck in PROCESSING.
         """
-        return self._transition(action_id, ActionStatus.PROCESSING)
+        sources = ALLOWED_FROM[ActionStatus.PROCESSING]
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE actions
+                SET status=?, processing_claimed_at=?, processing_deadline=?, updated_at=?
+                WHERE action_id=? AND status IN ({_placeholders(sources)})
+                """,
+                (
+                    ActionStatus.PROCESSING,
+                    now.isoformat(),
+                    (now + lease).isoformat(),
+                    _now_iso(),
+                    action_id,
+                    *sorted(sources),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def stale_processing(self, now: datetime) -> tuple[StoredAction, ...]:
+        """Claims whose lease has run out. Server time only; no device clock."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM actions
+                WHERE status=? AND processing_deadline IS NOT NULL AND processing_deadline<=?
+                ORDER BY processing_deadline
+                """,
+                (ActionStatus.PROCESSING, now.isoformat()),
+            ).fetchall()
+        return tuple(self._action_from_row(row) for row in rows)
 
     def _transition(
         self,
@@ -628,10 +721,15 @@ class SQLiteIntegrationStore:
             unapplied_rows = connection.execute(
                 """
                 SELECT event_id FROM outbox
-                WHERE projection_id=? AND state IN (?,?)
+                WHERE projection_id=? AND state IN (?,?,?)
                 ORDER BY aggregate_id, aggregate_version
                 """,
-                (projection_id, OutboxState.PENDING, OutboxState.PARKED_FOR_GAP),
+                (
+                    projection_id,
+                    OutboxState.PENDING,
+                    OutboxState.PARKED_FOR_GAP,
+                    OutboxState.NEEDS_ATTENTION,
+                ),
             ).fetchall()
         active = tuple(
             str(item["action_id"])
@@ -690,6 +788,8 @@ class SQLiteIntegrationStore:
             command_id=str(row["command_id"]),
             external_reference=str(row["external_reference"]),
             reauthorization_expires_at=_dt(row["reauthorization_expires_at"]),
+            idempotency_fingerprint=str(row["idempotency_fingerprint"]),
+            processing_deadline=_dt(row["processing_deadline"]),
         )
 
     def _event_from_row(self, row: sqlite3.Row) -> OutboxEvent:

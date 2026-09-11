@@ -177,7 +177,12 @@ class WalkingSkeleton:
         stored = self._require_action(action_id)
         if stored.status.is_terminal:
             return stored.status
-        if not self.store.claim_for_processing(action_id):
+        spec = self.specs[stored.spec_name]
+        if not self.store.claim_for_processing(
+            action_id,
+            now=self.clock.now(),
+            lease=timedelta(seconds=spec.processing_lease_seconds),
+        ):
             return self._require_action(action_id).status
 
         # Re-read under ownership: the terms may have moved between the first
@@ -195,7 +200,14 @@ class WalkingSkeleton:
         if decision.outcome is not PolicyOutcome.PERMIT:
             return self._refuse(stored, decision, now)
 
-        result = self.provider.execute(action, stored.external_reference)
+        try:
+            result = self.provider.execute(action, stored.external_reference)
+        except Exception:
+            # The request may already have reached the provider. Leaving the
+            # action PROCESSING would strand it, and calling it FAILED would
+            # claim knowledge we do not have.
+            self.store.update_action_status(action_id, ActionStatus.UNKNOWN)
+            raise
         if result.outcome is ProviderOutcome.TIMEOUT:
             self.store.update_action_status(action_id, ActionStatus.UNKNOWN)
             return ActionStatus.UNKNOWN
@@ -229,8 +241,9 @@ class WalkingSkeleton:
             if self.provider.supports_idempotency:
                 self.store.update_action_status(action_id, ActionStatus.PENDING)
                 return ActionStatus.PENDING
-            self.store.update_action_status(action_id, ActionStatus.NEEDS_ATTENTION)
-            return ActionStatus.NEEDS_ATTENTION
+            return self._settle(
+                stored, ActionStatus.NEEDS_ATTENTION, IntegrationEventType.ACTION_NEEDS_ATTENTION
+            )
         outcome = self.provider.lookup(stored.external_reference)
         if outcome is LookupOutcome.SUCCEEDED:
             return self._settle(
@@ -241,8 +254,9 @@ class WalkingSkeleton:
         if outcome is LookupOutcome.NOT_FOUND and self.provider.supports_idempotency:
             self.store.update_action_status(action_id, ActionStatus.PENDING)
             return ActionStatus.PENDING
-        self.store.update_action_status(action_id, ActionStatus.NEEDS_ATTENTION)
-        return ActionStatus.NEEDS_ATTENTION
+        return self._settle(
+            stored, ActionStatus.NEEDS_ATTENTION, IntegrationEventType.ACTION_NEEDS_ATTENTION
+        )
 
     def expire_reauthorizations(self) -> tuple[str, ...]:
         now = self.clock.now()
@@ -252,14 +266,31 @@ class WalkingSkeleton:
             if expiry is None or now < expiry:
                 continue
             spec = self.specs[stored.spec_name]
-            status = (
-                ActionStatus.CANCELLED
-                if spec.reauthorization_expiry_policy is ReauthorizationExpiryPolicy.CANCEL
-                else ActionStatus.NEEDS_ATTENTION
+            cancelling = spec.reauthorization_expiry_policy is ReauthorizationExpiryPolicy.CANCEL
+            status = ActionStatus.CANCELLED if cancelling else ActionStatus.NEEDS_ATTENTION
+            event_type = (
+                IntegrationEventType.ACTION_CANCELLED
+                if cancelling
+                else IntegrationEventType.ACTION_NEEDS_ATTENTION
             )
-            self.store.update_action_status(stored.action_id, status)
+            self._settle(stored, status, event_type)
             changed.append(stored.action_id)
         return tuple(changed)
+
+    def recover_stale_processing(self, now: datetime | None = None) -> tuple[str, ...]:
+        """Reclaim actions whose worker never came back.
+
+        They become UNKNOWN, never PENDING: the worker may have reached the
+        provider before it died, and putting the action back in the queue would
+        book the appointment twice. UNKNOWN then goes through the ordinary
+        reconciliation rules, which retry only where that is provably safe.
+        """
+        at = now or self.clock.now()
+        recovered: list[str] = []
+        for stored in self.store.stale_processing(at):
+            self.store.update_action_status(stored.action_id, ActionStatus.UNKNOWN)
+            recovered.append(stored.action_id)
+        return tuple(recovered)
 
     def dispatch_outbox(self, *, gap_timeout: timedelta = timedelta(minutes=5)) -> None:
         self.registry.validate()

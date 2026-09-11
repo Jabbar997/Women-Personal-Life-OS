@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from wplos.core.identifiers import ActionId, AuthorizationId, UserId
+from wplos.core.identifiers import ActionId, AuthorizationId, EntityId, UserId
 from wplos.core.roles import AgentName
 from wplos.integration import (
     ALLOWED_FROM,
@@ -17,6 +17,7 @@ from wplos.integration import (
     ConsumerRegistry,
     EventSpec,
     ExecutionMode,
+    IdempotencyConflict,
     IllegalTransition,
     IntegrationEventType,
     LookupOutcome,
@@ -31,10 +32,13 @@ from wplos.integration import (
     ReauthorizationExpiryPolicy,
     SQLiteIntegrationStore,
     WalkingSkeleton,
+    idempotency_fingerprint,
 )
 from wplos.policy.execution import AuthorizationMethod, ExecutionAuthorization, ProposedAction
 from wplos.policy.guardian import GuardianVerdict
 from wplos.policy.permissions import ActionDomain, PermissionLevel, ReversibilityClass
+
+LEASE = timedelta(seconds=300)
 
 
 class FixedClock:
@@ -107,11 +111,7 @@ def make_spec() -> ActionSpec:
         ordering_policy=OrderingPolicy.PER_AGGREGATE,
         reversibility=ReversibilityClass.COMPENSATABLE,
         post_commit_failure_policy=PostCommitFailurePolicy.NEEDS_ATTENTION,
-        emitted_events=(
-            IntegrationEventType.ACTION_ACCEPTED,
-            IntegrationEventType.ACTION_SUCCEEDED,
-            IntegrationEventType.ACTION_FAILED,
-        ),
+        emitted_events=tuple(IntegrationEventType),
         affected_projections=("today",),
         reauthorization_ttl_seconds=60,
         reauthorization_expiry_policy=ReauthorizationExpiryPolicy.CANCEL,
@@ -121,11 +121,7 @@ def make_spec() -> ActionSpec:
 def make_registry() -> ConsumerRegistry:
     specs = tuple(
         EventSpec(event_type=event_type, schema_version=1, declared_consumers=("today_projection",))
-        for event_type in (
-            IntegrationEventType.ACTION_ACCEPTED,
-            IntegrationEventType.ACTION_SUCCEEDED,
-            IntegrationEventType.ACTION_FAILED,
-        )
+        for event_type in IntegrationEventType
     )
     registry = ConsumerRegistry(specs)
 
@@ -135,11 +131,7 @@ def make_registry() -> ConsumerRegistry:
             raise TypeError("projection_id must be a string")
         return ConsumerEffect(projection_id=projection_id)
 
-    for event_type in (
-        IntegrationEventType.ACTION_ACCEPTED,
-        IntegrationEventType.ACTION_SUCCEEDED,
-        IntegrationEventType.ACTION_FAILED,
-    ):
+    for event_type in IntegrationEventType:
         registry.register(event_type, "today_projection", project)
     registry.validate()
     return registry
@@ -568,7 +560,7 @@ def test_a_failed_action_cannot_be_moved_back_to_processing(tmp_path: Path) -> N
 
     with pytest.raises(IllegalTransition):
         store.update_action_status(action_id, ActionStatus.PROCESSING)
-    assert store.claim_for_processing(action_id) is False
+    assert store.claim_for_processing(action_id, now=clock.now(), lease=LEASE) is False
 
     assert store.get_action(action_id).status is ActionStatus.FAILED  # type: ignore[union-attr]
 
@@ -601,8 +593,8 @@ def test_a_claim_cannot_be_taken_twice(tmp_path: Path) -> None:
     kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
     action_id = accept(kernel, clock.now())
 
-    assert store.claim_for_processing(action_id) is True
-    assert store.claim_for_processing(action_id) is False
+    assert store.claim_for_processing(action_id, now=clock.now(), lease=LEASE) is True
+    assert store.claim_for_processing(action_id, now=clock.now(), lease=LEASE) is False
 
 
 def test_a_reused_action_id_is_not_mistaken_for_a_duplicate_request(
@@ -674,3 +666,283 @@ def test_a_duplicate_aggregate_version_is_not_mistaken_for_a_duplicate_request(
                 parked_at=None,
             )
         )
+
+
+# --- BLOCKING-03A: an unresolved event keeps the projection stale ---------
+
+
+def test_an_outbox_event_in_needs_attention_keeps_the_projection_stale(
+    tmp_path: Path,
+) -> None:
+    """NEEDS_ATTENTION means the event never reached its consumer.
+
+    Parked and pending already counted; giving up on an event does not make it
+    applied, so the projection it affects is still behind.
+    """
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+    kernel.dispatch_outbox()
+    assert kernel.execute(action_id) is ActionStatus.SUCCEEDED
+    kernel.dispatch_outbox()
+    assert not store.projection_state("today").is_stale
+
+    # A result event that arrives out of sequence and never recovers.
+    store.inject_event(
+        OutboxEvent(
+            event_id="evt_orphan",
+            event_type=IntegrationEventType.ACTION_NEEDS_ATTENTION,
+            schema_version=1,
+            aggregate_id=action_id,
+            aggregate_version=9,
+            action_id=action_id,
+            client_request_id="cli_1",
+            correlation_id="cor_1",
+            command_id="cmd_1",
+            causation_id=None,
+            payload={
+                "action_id": action_id,
+                "status": "NEEDS_ATTENTION",
+                "projection_id": "today",
+            },
+            state=OutboxState.PENDING,
+            parked_at=None,
+            projection_id="today",
+        )
+    )
+    kernel.dispatch_outbox()
+    parked = store.pending_events()[0]
+    assert parked.state is OutboxState.PARKED_FOR_GAP
+    assert store.projection_state("today").is_stale
+
+    clock.current += timedelta(minutes=10)
+    kernel.dispatch_outbox()
+
+    state = store.projection_state("today")
+    assert state.active_action_ids == ()
+    assert "evt_orphan" in state.unapplied_event_ids
+    assert state.is_stale
+
+
+# --- BLOCKING-03B: terminal outcomes reach the projection ----------------
+
+
+def test_cancellation_reaches_the_projection(tmp_path: Path) -> None:
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+    kernel.dispatch_outbox()
+    stored = store.get_action(action_id)
+    assert stored is not None
+    store.update_action_terms(stored.proposed_action.with_terms(price_minor=321))
+    assert kernel.execute(action_id) is ActionStatus.REAUTHORIZATION_REQUIRED
+
+    clock.current += timedelta(seconds=61)
+    assert kernel.expire_reauthorizations() == (action_id,)
+    assert store.get_action(action_id).status is ActionStatus.CANCELLED  # type: ignore[union-attr]
+
+    cancellation_event_id = store.last_event_id(action_id)
+    before = store.projection_state("today")
+    assert before.active_action_ids == ()
+    assert before.is_stale
+
+    kernel.dispatch_outbox()
+    after = store.projection_state("today")
+
+    assert not after.is_stale
+    assert after.last_applied_event_id == cancellation_event_id
+
+
+def test_needs_attention_reaches_the_projection(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        outcome=ProviderOutcome.TIMEOUT,
+        supports_idempotency=False,
+        supports_lookup=False,
+    )
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path, provider=provider)
+    action_id = accept(kernel, clock.now())
+    kernel.dispatch_outbox()
+    assert kernel.execute(action_id) is ActionStatus.UNKNOWN
+    assert kernel.reconcile_unknown(action_id) is ActionStatus.NEEDS_ATTENTION
+
+    result_event_id = store.last_event_id(action_id)
+    before = store.projection_state("today")
+    assert before.active_action_ids == ()
+    assert before.is_stale
+
+    kernel.dispatch_outbox()
+    after = store.projection_state("today")
+
+    assert not after.is_stale
+    assert after.last_applied_event_id == result_event_id
+
+
+# --- BLOCKING-07: the key identifies a command, not just a caller ---------
+
+
+def test_the_same_command_retried_returns_the_same_action(tmp_path: Path) -> None:
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+
+    first = accept(kernel, clock.now(), client_request_id="cli_retry", action_id="act_first")
+    second = accept(kernel, clock.now(), client_request_id="cli_retry", action_id="act_second")
+
+    assert first == second
+    assert store.count_actions() == 1
+    assert store.count_outbox() == 1
+
+
+def test_a_reused_key_with_a_changed_material_term_is_refused(tmp_path: Path) -> None:
+    """Returning the first booking would charge her the price she did not ask for."""
+    kernel, _store, _guardian, _provider, clock = make_kernel(tmp_path)
+    now = clock.now()
+    cheap = make_action(now, price=100, action_id="act_cheap")
+    kernel.accept(
+        action=cheap,
+        authorization=make_authorization(cheap, now),
+        client_request_id="cli_same",
+        spec_name="TEST_BOOK",
+        projection_id="today",
+        correlation_id="cor_1",
+        command_id="cmd_1",
+    )
+    dearer = make_action(now, price=150, action_id="act_dearer")
+
+    with pytest.raises(IdempotencyConflict, match="different command"):
+        kernel.accept(
+            action=dearer,
+            authorization=make_authorization(dearer, now),
+            client_request_id="cli_same",
+            spec_name="TEST_BOOK",
+            projection_id="today",
+            correlation_id="cor_2",
+            command_id="cmd_2",
+        )
+
+
+def test_a_reused_key_with_a_different_target_is_refused(tmp_path: Path) -> None:
+    kernel, _store, _guardian, _provider, clock = make_kernel(tmp_path)
+    now = clock.now()
+    here = make_action(now, action_id="act_here")
+    kernel.accept(
+        action=here,
+        authorization=make_authorization(here, now),
+        client_request_id="cli_target",
+        spec_name="TEST_BOOK",
+        projection_id="today",
+        correlation_id="cor_1",
+        command_id="cmd_1",
+    )
+    elsewhere = here.model_copy(
+        update={"action_id": ActionId("act_there"), "target_entity_id": EntityId("ent_other")}
+    )
+
+    with pytest.raises(IdempotencyConflict):
+        kernel.accept(
+            action=elsewhere,
+            authorization=make_authorization(elsewhere, now),
+            client_request_id="cli_target",
+            spec_name="TEST_BOOK",
+            projection_id="today",
+            correlation_id="cor_2",
+            command_id="cmd_2",
+        )
+
+
+def test_a_reused_key_for_a_different_projection_is_refused(tmp_path: Path) -> None:
+    kernel, _store, _guardian, _provider, clock = make_kernel(tmp_path)
+    now = clock.now()
+    action = make_action(now, action_id="act_proj")
+    kernel.accept(
+        action=action,
+        authorization=make_authorization(action, now),
+        client_request_id="cli_proj",
+        spec_name="TEST_BOOK",
+        projection_id="today",
+        correlation_id="cor_1",
+        command_id="cmd_1",
+    )
+    other = make_action(now, action_id="act_proj_2")
+
+    with pytest.raises(IdempotencyConflict):
+        kernel.accept(
+            action=other,
+            authorization=make_authorization(other, now),
+            client_request_id="cli_proj",
+            spec_name="TEST_BOOK",
+            projection_id="tomorrow",
+            correlation_id="cor_2",
+            command_id="cmd_2",
+        )
+
+
+def test_the_fingerprint_ignores_values_generated_per_attempt(tmp_path: Path) -> None:
+    """A retry mints a new action id and correlation; that is not a new command."""
+    now = datetime(2026, 9, 12, 12, tzinfo=UTC)
+    first = make_action(now, action_id="act_one")
+    second = make_action(now, action_id="act_two")
+
+    assert idempotency_fingerprint(
+        first, spec_name="TEST_BOOK", projection_id="today"
+    ) == idempotency_fingerprint(second, spec_name="TEST_BOOK", projection_id="today")
+
+
+# --- BLOCKING-08: a claim that is never released -------------------------
+
+
+class ExplodingProvider(FakeProvider):
+    def execute(self, action: ProposedAction, external_reference: str) -> ProviderResult:
+        self.calls.append(external_reference)
+        raise RuntimeError("provider connection dropped")
+
+
+def test_a_provider_that_raises_leaves_the_action_unknown(tmp_path: Path) -> None:
+    """Not FAILED: the request may already have reached them."""
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path, provider=ExplodingProvider())
+    action_id = accept(kernel, clock.now())
+
+    with pytest.raises(RuntimeError, match="provider connection dropped"):
+        kernel.execute(action_id)
+
+    stored = store.get_action(action_id)
+    assert stored is not None
+    assert stored.status is ActionStatus.UNKNOWN
+    assert stored.status is not ActionStatus.PROCESSING
+
+
+def test_a_dead_worker_leaves_a_claim_that_recovery_reclaims(tmp_path: Path) -> None:
+    kernel, store, _guardian, provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+    # A worker claims the action and is killed before it can settle anything.
+    assert store.claim_for_processing(action_id, now=clock.now(), lease=LEASE) is True
+    assert store.get_action(action_id).status is ActionStatus.PROCESSING  # type: ignore[union-attr]
+
+    clock.current += LEASE + timedelta(seconds=1)
+    assert kernel.recover_stale_processing() == (action_id,)
+
+    stored = store.get_action(action_id)
+    assert stored is not None
+    assert stored.status is ActionStatus.UNKNOWN
+    # Recovery never puts it back in the queue: the provider may already have run.
+    assert stored.status is not ActionStatus.PENDING
+    assert provider.calls == []
+
+
+def test_a_live_claim_is_not_stolen(tmp_path: Path) -> None:
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+    assert store.claim_for_processing(action_id, now=clock.now(), lease=LEASE) is True
+
+    clock.current += LEASE - timedelta(seconds=1)
+
+    assert kernel.recover_stale_processing() == ()
+    assert store.get_action(action_id).status is ActionStatus.PROCESSING  # type: ignore[union-attr]
+
+
+def test_a_recovered_claim_without_a_safe_lookup_needs_attention(tmp_path: Path) -> None:
+    provider = FakeProvider(supports_idempotency=False, supports_lookup=False)
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path, provider=provider)
+    action_id = accept(kernel, clock.now())
+    store.claim_for_processing(action_id, now=clock.now(), lease=LEASE)
+    clock.current += LEASE + timedelta(seconds=1)
+    assert kernel.recover_stale_processing() == (action_id,)
+
+    assert kernel.reconcile_unknown(action_id) is ActionStatus.NEEDS_ATTENTION
+    assert provider.calls == []

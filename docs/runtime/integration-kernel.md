@@ -28,6 +28,8 @@ reconciliation scheduler, push transport, or external provider SDK.
    named explicitly as the conflict target. It is not a read-then-write convention, and
    no other integrity error is read as "I have seen this request". A reused action id, a
    reused event id or a duplicate aggregate version is a bug and surfaces as one.
+   The key also binds to the command: a reused key carrying different terms raises
+   `IdempotencyConflict` rather than returning the first operation.
 3. Delivery is at-least-once. Consumer effects are deduplicated durably by
    `(consumer_name, event_id)`.
 4. Events are ordered per aggregate, never globally. A version *ahead* of what a
@@ -43,16 +45,21 @@ reconciliation scheduler, push transport, or external provider SDK.
 9. A provider without idempotency or reliable lookup is never automatically retried
    after an ambiguous timeout.
 10. Projection staleness is derived from two things: a non-terminal action affecting
-    the projection, or a result event affecting it that is still unapplied. The server
-    never promises an `expected_projection_version`. An action reaching `SUCCEEDED`
-    does not make the view current while its event is still in the outbox.
-11. A projection records `last_applied_event_id`. The client follows `action_id` until
+    the projection, or an event affecting it that has not been applied — `PENDING`,
+    `PARKED_FOR_GAP` or `NEEDS_ATTENTION`. Giving up on an event does not make it
+    applied. The server never promises an `expected_projection_version`, and an action
+    reaching `SUCCEEDED` does not make the view current while its event is still queued.
+11. Every terminal outcome emits a lifecycle event, including the ones no provider was
+    involved in. `CANCELLED` and `NEEDS_ATTENTION` settle atomically with
+    `ACTION_CANCELLED` and `ACTION_NEEDS_ATTENTION`, so a projection is never left
+    behind by a path that ended quietly.
+12. A projection records `last_applied_event_id`. The client follows `action_id` until
     a terminal state, including failure.
-12. Every event contract has a schema version. Consumers tolerate unknown fields and
+13. Every event contract has a schema version. Consumers tolerate unknown fields and
     accept current and N-1 versions during migration.
-13. Event payloads are sufficient for the consumer but avoid personal narrative or raw
+14. Event payloads are sufficient for the consumer but avoid personal narrative or raw
     sensitive content. The skeleton carries ids, status and projection identity only.
-14. Exactly one worker executes an action. Ownership is taken by a conditional UPDATE
+15. Exactly one worker executes an action. Ownership is taken by a conditional UPDATE
     inside a transaction, never by a process lock, and the status machine is enforced in
     the same statement rather than checked beforehand.
 
@@ -130,6 +137,34 @@ Because consumers advance separately, one that failed after another succeeded ca
 on the retry: the consumer that already applied the event skips it, the one that is
 behind receives it, and the event is not parked for a gap that never existed.
 
+## Idempotency
+
+`UNIQUE(user_id, client_request_id)` decides who wins a race. It does not, on its own,
+establish that two requests are the same request — a client could reuse a key for a
+different command, and returning the first operation would then run something the caller
+did not ask for under a key that claims the two are identical.
+
+Each accepted action therefore stores an `idempotency_fingerprint`: a digest of the
+logical command — owner, spec, projection, domain, permission level, target,
+reversibility, material terms and parameters.
+
+```text
+same key + same fingerprint   →  return the existing action
+same key + other fingerprint  →  IdempotencyConflict
+```
+
+Five things are deliberately outside the digest. `action_id`, `proposed_at`,
+`correlation_id`, `command_id` and `external_reference` are generated per attempt, so
+including them would make every retry a different command — the opposite of an
+idempotency key. `offer_expires_at` is derived from server time when the offer is built,
+so two retries seconds apart would collide on it. `summary` is display text describing
+the operation rather than defining it.
+
+`parameters` *is* inside it. Consent deliberately ignores that field — ADR-006 exists so
+an incidental retry counter cannot revoke an authorization — but request identity is a
+different question from consent, and a request that differs at all is better refused than
+silently answered with an earlier one.
+
 ## Execution ownership
 
 `execute` claims the action before it decides anything:
@@ -144,6 +179,20 @@ each asking Guardian would produce two assessments of the same action, and the s
 retires the first — so the loser's verdict would arrive stale through no fault of its
 own. Re-reading after the claim also picks up terms that moved between the first look
 and the claim.
+
+A claim is a lease, not a permanent grant. `processing_claimed_at` and
+`processing_deadline` are written with it, so a worker that dies holds nothing forever:
+
+```text
+recover_stale_processing(now)  →  PROCESSING past its deadline becomes UNKNOWN
+```
+
+`UNKNOWN`, never `PENDING`. The dead worker may have reached the provider before it
+died, and requeueing would book the appointment twice. From `UNKNOWN` the ordinary
+reconciliation rules apply, and they retry only where the provider makes that provably
+safe. The same reasoning covers a provider call that raises: the request may already have
+landed, so the action becomes `UNKNOWN` and the error is re-raised for the operator
+rather than being recorded as a failure the system cannot actually claim.
 
 `ALLOWED_FROM` is the state machine. Every terminal status is absent from its value
 sets, so `SUCCEEDED → PENDING`, `FAILED → PROCESSING` and `CANCELLED → PENDING` cannot be
@@ -188,7 +237,11 @@ The skeleton is not accepted because files exist. It must survive these behavior
    `UNIQUE(user_id, client_request_id)` alone decides the winner, creating one logical
    action and one initial outbox event, and both callers are given the same action.
 
-Additional tests cover gap recovery, a consumer catching up after a partial failure,
+Additional tests cover outbox `NEEDS_ATTENTION` keeping a projection stale, the
+cancellation and needs-attention paths reaching the projection, a reused idempotency key
+carrying different terms, a stale claim recovered to `UNKNOWN`, a live claim that is not
+stolen, a provider exception leaving `UNKNOWN`, gap recovery, a consumer catching up
+after a partial failure,
 concurrent execution calling the provider exactly once, rejected terminal transitions,
 integrity errors that must not be mistaken for duplicate requests, server-clock
 reauthorization expiry and registry registration drift.

@@ -18,6 +18,8 @@ class IntegrationEventType(StrEnum):
     ACTION_ACCEPTED = "ACTION_ACCEPTED"
     ACTION_SUCCEEDED = "ACTION_SUCCEEDED"
     ACTION_FAILED = "ACTION_FAILED"
+    ACTION_CANCELLED = "ACTION_CANCELLED"
+    ACTION_NEEDS_ATTENTION = "ACTION_NEEDS_ATTENTION"
 
 
 class ExecutionMode(StrEnum):
@@ -58,6 +60,8 @@ class ActionSpec:
     affected_projections: tuple[str, ...]
     reauthorization_ttl_seconds: int = 900
     reauthorization_expiry_policy: ReauthorizationExpiryPolicy = ReauthorizationExpiryPolicy.CANCEL
+    processing_lease_seconds: int = 300
+    """How long a worker may hold a claim before the claim is assumed abandoned."""
 
     def __post_init__(self) -> None:
         if self.execution_mode is ExecutionMode.ASYNC and not self.idempotency_required:
@@ -69,6 +73,8 @@ class ActionSpec:
             raise ValueError("authorized external actions must be server-only")
         if self.reauthorization_ttl_seconds <= 0:
             raise ValueError("reauthorization TTL must be positive")
+        if self.processing_lease_seconds <= 0:
+            raise ValueError("processing lease must be positive")
 
 
 @dataclass(frozen=True, slots=True)
