@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,15 +10,15 @@ import pytest
 from wplos.core.identifiers import ActionId, AuthorizationId, UserId
 from wplos.core.roles import AgentName
 from wplos.integration import (
-    ACTION_ACCEPTED,
-    ACTION_FAILED,
-    ACTION_SUCCEEDED,
+    ALLOWED_FROM,
     ActionSpec,
     ActionStatus,
     ConsumerEffect,
     ConsumerRegistry,
     EventSpec,
     ExecutionMode,
+    IllegalTransition,
+    IntegrationEventType,
     LookupOutcome,
     MutableGuardian,
     OfflinePolicy,
@@ -70,9 +71,9 @@ class FakeProvider:
         return self.lookup_outcome
 
 
-def make_action(now: datetime, *, price: int = 100) -> ProposedAction:
+def make_action(now: datetime, *, price: int = 100, action_id: str = "act_walk") -> ProposedAction:
     return ProposedAction(
-        action_id=ActionId("act_walk"),
+        action_id=ActionId(action_id),
         owner_id=UserId("usr_walk"),
         proposed_by=AgentName.OPERATOR,
         proposed_at=now,
@@ -106,7 +107,11 @@ def make_spec() -> ActionSpec:
         ordering_policy=OrderingPolicy.PER_AGGREGATE,
         reversibility=ReversibilityClass.COMPENSATABLE,
         post_commit_failure_policy=PostCommitFailurePolicy.NEEDS_ATTENTION,
-        emitted_events=(ACTION_ACCEPTED, ACTION_SUCCEEDED, ACTION_FAILED),
+        emitted_events=(
+            IntegrationEventType.ACTION_ACCEPTED,
+            IntegrationEventType.ACTION_SUCCEEDED,
+            IntegrationEventType.ACTION_FAILED,
+        ),
         affected_projections=("today",),
         reauthorization_ttl_seconds=60,
         reauthorization_expiry_policy=ReauthorizationExpiryPolicy.CANCEL,
@@ -116,7 +121,11 @@ def make_spec() -> ActionSpec:
 def make_registry() -> ConsumerRegistry:
     specs = tuple(
         EventSpec(event_type=event_type, schema_version=1, declared_consumers=("today_projection",))
-        for event_type in (ACTION_ACCEPTED, ACTION_SUCCEEDED, ACTION_FAILED)
+        for event_type in (
+            IntegrationEventType.ACTION_ACCEPTED,
+            IntegrationEventType.ACTION_SUCCEEDED,
+            IntegrationEventType.ACTION_FAILED,
+        )
     )
     registry = ConsumerRegistry(specs)
 
@@ -126,7 +135,11 @@ def make_registry() -> ConsumerRegistry:
             raise TypeError("projection_id must be a string")
         return ConsumerEffect(projection_id=projection_id)
 
-    for event_type in (ACTION_ACCEPTED, ACTION_SUCCEEDED, ACTION_FAILED):
+    for event_type in (
+        IntegrationEventType.ACTION_ACCEPTED,
+        IntegrationEventType.ACTION_SUCCEEDED,
+        IntegrationEventType.ACTION_FAILED,
+    ):
         registry.register(event_type, "today_projection", project)
     registry.validate()
     return registry
@@ -154,8 +167,14 @@ def make_kernel(
     return kernel, store, guardian, external, fixed
 
 
-def accept(kernel: WalkingSkeleton, now: datetime, *, client_request_id: str = "cli_1") -> str:
-    action = make_action(now)
+def accept(
+    kernel: WalkingSkeleton,
+    now: datetime,
+    *,
+    client_request_id: str = "cli_1",
+    action_id: str = "act_walk",
+) -> str:
+    action = make_action(now, action_id=action_id)
     authorization = make_authorization(action, now)
     stored, _created = kernel.accept(
         action=action,
@@ -191,12 +210,16 @@ def test_02_duplicate_delivery_has_one_logical_effect(tmp_path: Path) -> None:
     kernel.dispatch_outbox()
     assert store.processed_count("today_projection", event.event_id) == 1
 
-    # Simulate broker redelivery of the same event id. The consumer-side durable
-    # dedupe key, not the outbox state alone, prevents a second logical effect.
+    # Simulate broker redelivery of the same event id. The consumer is already
+    # past this version, which is a replay rather than a hole in the stream: it
+    # must reach the no-op path instead of being parked as a gap.
     store.mark_event_state(event.event_id, OutboxState.PENDING)
     kernel.dispatch_outbox()
+
     assert store.processed_count("today_projection", event.event_id) == 1
     assert store.count_actions() == 1
+    assert store.pending_events() == ()
+    assert store.last_consumer_version("today_projection", event.aggregate_id) == 1
 
 
 def test_03_provider_timeout_becomes_unknown(tmp_path: Path) -> None:
@@ -248,17 +271,60 @@ def test_07_projection_staleness_follows_active_action_not_promised_version(tmp_
     assert action_id in before.active_action_ids
     assert before.is_stale
 
+    # C: a failing action still terminates. It is stale while its result event is
+    # in flight, and fresh once that event lands — not stale forever.
     assert kernel.execute(action_id) is ActionStatus.FAILED
+    settled = store.projection_state("today")
+    assert settled.active_action_ids == ()
+    assert settled.is_stale
+
+    kernel.dispatch_outbox()
     after = store.projection_state("today")
     assert not after.is_stale
-    assert after.active_action_ids == ()
+    assert after.unapplied_event_ids == ()
+
+
+def test_projection_is_not_fresh_while_the_success_event_is_still_queued(
+    tmp_path: Path,
+) -> None:
+    """A: the action is SUCCEEDED but the projection has not seen it yet.
+
+    Reporting fresh here would tell a reader the view is current while it still
+    shows the state from before the action ran.
+    """
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+    kernel.dispatch_outbox()
+    assert kernel.execute(action_id) is ActionStatus.SUCCEEDED
+
+    state = store.projection_state("today")
+
+    assert state.active_action_ids == ()
+    assert state.unapplied_event_ids != ()
+    assert state.is_stale
+
+
+def test_projection_becomes_fresh_once_the_success_event_is_applied(tmp_path: Path) -> None:
+    """B: and fresh only then, pointing at the success event."""
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+    kernel.dispatch_outbox()
+    assert kernel.execute(action_id) is ActionStatus.SUCCEEDED
+    success_event_id = store.last_event_id(action_id)
+
+    kernel.dispatch_outbox()
+    state = store.projection_state("today")
+
+    assert not state.is_stale
+    assert state.unapplied_event_ids == ()
+    assert state.last_applied_event_id == success_event_id
 
 
 def test_08_tolerant_reader_ignores_new_event_field(tmp_path: Path) -> None:
     kernel, store, _guardian, _provider, _clock = make_kernel(tmp_path)
     event = OutboxEvent(
         event_id="evt_extra",
-        event_type=ACTION_ACCEPTED,
+        event_type=IntegrationEventType.ACTION_ACCEPTED,
         schema_version=1,
         aggregate_id="agg_extra",
         aggregate_version=1,
@@ -282,34 +348,51 @@ def test_08_tolerant_reader_ignores_new_event_field(tmp_path: Path) -> None:
 
 
 def test_09_concurrent_idempotency_is_database_enforced(tmp_path: Path) -> None:
+    """Two callers, two different action ids, one client request id.
+
+    The action primary key cannot decide this: the ids differ. Only
+    UNIQUE(user_id, client_request_id) can, which is the constraint that is
+    actually supposed to carry idempotency.
+    """
     kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
     barrier = threading.Barrier(2)
     ids: list[str] = []
     errors: list[BaseException] = []
 
-    def submit() -> None:
+    def submit(action_id: str) -> None:
         try:
             barrier.wait()
-            ids.append(accept(kernel, clock.now(), client_request_id="same_request"))
+            ids.append(
+                accept(
+                    kernel,
+                    clock.now(),
+                    client_request_id="same_request",
+                    action_id=action_id,
+                )
+            )
         except BaseException as exc:  # test captures thread errors for assertion
             errors.append(exc)
 
-    threads = [threading.Thread(target=submit) for _ in range(2)]
+    threads = [threading.Thread(target=submit, args=(name,)) for name in ("act_A", "act_B")]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
 
     assert errors == []
+    assert len(ids) == 2
     assert len(set(ids)) == 1
+    winner = ids[0]
+    assert winner in {"act_A", "act_B"}
     assert store.count_actions() == 1
     assert store.count_outbox() == 1
+    assert store.get_action(winner) is not None
 
 
 def test_gap_is_parked_then_recovers_when_missing_version_arrives(tmp_path: Path) -> None:
     kernel, store, _guardian, _provider, _clock = make_kernel(tmp_path)
     base: dict[str, object] = {
-        "event_type": ACTION_ACCEPTED,
+        "event_type": IntegrationEventType.ACTION_ACCEPTED,
         "schema_version": 1,
         "aggregate_id": "agg_gap",
         "action_id": "act_gap",
@@ -345,7 +428,11 @@ def test_reauthorization_ttl_uses_server_clock_and_expires(tmp_path: Path) -> No
 
 def test_registry_validation_catches_declared_runtime_drift() -> None:
     registry = ConsumerRegistry(
-        (EventSpec(ACTION_ACCEPTED, 1, declared_consumers=("today_projection",)),)
+        (
+            EventSpec(
+                IntegrationEventType.ACTION_ACCEPTED, 1, declared_consumers=("today_projection",)
+            ),
+        )
     )
     with pytest.raises(ValueError, match="consumer registry mismatch"):
         registry.validate()
@@ -366,3 +453,224 @@ def test_projection_state_reads_an_empty_row_without_inventing_values(tmp_path: 
     assert state.last_applied_event_id is None
     assert state.updated_at is None
     assert not state.is_stale
+
+
+def test_concurrent_execute_calls_the_provider_once(tmp_path: Path) -> None:
+    """Two workers, one side effect.
+
+    Without a claim both pass the policy and both reach the provider, which for
+    a booking means two bookings. The winner is decided by a conditional UPDATE,
+    so this holds across processes, not just across threads in one interpreter.
+    """
+    kernel, store, _guardian, provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+    barrier = threading.Barrier(2)
+    outcomes: list[ActionStatus] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            barrier.wait()
+            outcomes.append(kernel.execute(action_id))
+        except BaseException as exc:  # test captures thread errors for assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(provider.calls) == 1
+    assert ActionStatus.SUCCEEDED in outcomes
+    assert store.get_action(action_id).status is ActionStatus.SUCCEEDED  # type: ignore[union-attr]
+    # Exactly one accepted event and one result event: no double settle.
+    assert store.count_outbox() == 2
+
+
+def test_a_consumer_that_failed_catches_up_without_a_permanent_park(
+    tmp_path: Path,
+) -> None:
+    """One consumer applied, the next raised. The retry must let it catch up.
+
+    Parking here would be wrong twice over: nothing is missing from the stream,
+    and the consumer that is behind would never be given the event again.
+    """
+    specs = (
+        EventSpec(
+            event_type=IntegrationEventType.ACTION_ACCEPTED,
+            schema_version=1,
+            declared_consumers=("a_projection", "b_audit"),
+        ),
+    )
+    registry = ConsumerRegistry(specs)
+    attempts: list[str] = []
+
+    def a_projection(payload: dict[str, object]) -> ConsumerEffect:
+        attempts.append("a")
+        return ConsumerEffect(projection_id="today")
+
+    def b_audit(payload: dict[str, object]) -> ConsumerEffect:
+        attempts.append("b")
+        if attempts.count("b") == 1:
+            raise RuntimeError("audit sink unavailable")
+        return ConsumerEffect(projection_id=None)
+
+    registry.register(IntegrationEventType.ACTION_ACCEPTED, "a_projection", a_projection)
+    registry.register(IntegrationEventType.ACTION_ACCEPTED, "b_audit", b_audit)
+
+    store = SQLiteIntegrationStore(tmp_path / "catchup.sqlite3")
+    kernel = WalkingSkeleton(
+        store=store,
+        specs={"TEST_BOOK": make_spec()},
+        registry=registry,
+        guardian=MutableGuardian(),
+        provider=FakeProvider(),
+        clock=FixedClock(datetime(2026, 9, 12, 12, tzinfo=UTC)),
+    )
+    accept(kernel, kernel.clock.now())
+
+    with pytest.raises(RuntimeError, match="audit sink unavailable"):
+        kernel.dispatch_outbox()
+
+    event = store.pending_events()[0]
+    assert event.state is OutboxState.PENDING
+    assert store.last_consumer_version("a_projection", event.aggregate_id) == 1
+    assert store.last_consumer_version("b_audit", event.aggregate_id) == 0
+
+    kernel.dispatch_outbox()
+
+    assert store.pending_events() == ()
+    assert store.last_consumer_version("b_audit", event.aggregate_id) == 1
+    # The consumer that had already applied it did not apply it twice.
+    assert store.processed_count("a_projection", event.event_id) == 1
+    assert store.processed_count("b_audit", event.event_id) == 1
+
+
+def test_a_succeeded_action_cannot_be_moved_back_to_pending(tmp_path: Path) -> None:
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+    assert kernel.execute(action_id) is ActionStatus.SUCCEEDED
+
+    with pytest.raises(IllegalTransition):
+        store.update_action_status(action_id, ActionStatus.PENDING)
+
+    assert store.get_action(action_id).status is ActionStatus.SUCCEEDED  # type: ignore[union-attr]
+
+
+def test_a_failed_action_cannot_be_moved_back_to_processing(tmp_path: Path) -> None:
+    kernel, store, _guardian, _provider, clock = make_kernel(
+        tmp_path, provider=FakeProvider(outcome=ProviderOutcome.FAILED)
+    )
+    action_id = accept(kernel, clock.now())
+    assert kernel.execute(action_id) is ActionStatus.FAILED
+
+    with pytest.raises(IllegalTransition):
+        store.update_action_status(action_id, ActionStatus.PROCESSING)
+    assert store.claim_for_processing(action_id) is False
+
+    assert store.get_action(action_id).status is ActionStatus.FAILED  # type: ignore[union-attr]
+
+
+def test_a_cancelled_action_cannot_be_moved_back_to_pending(tmp_path: Path) -> None:
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+    stored = store.get_action(action_id)
+    assert stored is not None
+    store.update_action_terms(stored.proposed_action.with_terms(price_minor=777))
+    assert kernel.execute(action_id) is ActionStatus.REAUTHORIZATION_REQUIRED
+    clock.current += timedelta(seconds=61)
+    assert kernel.expire_reauthorizations() == (action_id,)
+
+    with pytest.raises(IllegalTransition):
+        store.update_action_status(action_id, ActionStatus.PENDING)
+
+    assert store.get_action(action_id).status is ActionStatus.CANCELLED  # type: ignore[union-attr]
+
+
+def test_no_transition_can_leave_a_terminal_status() -> None:
+    """The map is the state machine: a terminal status appears as no one's source."""
+    terminal = {status for status in ActionStatus if status.is_terminal}
+    reachable_from = {source for sources in ALLOWED_FROM.values() for source in sources}
+
+    assert not (terminal & reachable_from)
+
+
+def test_a_claim_cannot_be_taken_twice(tmp_path: Path) -> None:
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+
+    assert store.claim_for_processing(action_id) is True
+    assert store.claim_for_processing(action_id) is False
+
+
+def test_a_reused_action_id_is_not_mistaken_for_a_duplicate_request(
+    tmp_path: Path,
+) -> None:
+    """Only the idempotency key means "seen before".
+
+    Swallowing a primary-key clash as a duplicate would silently drop a genuine
+    second request, and its outbox event with it.
+    """
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    accept(kernel, clock.now(), client_request_id="cli_first", action_id="act_same")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        accept(kernel, clock.now(), client_request_id="cli_second", action_id="act_same")
+
+    assert store.count_actions() == 1
+    assert store.count_outbox() == 1
+
+
+def test_a_reused_event_id_is_not_mistaken_for_a_duplicate_request(
+    tmp_path: Path,
+) -> None:
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    accept(kernel, clock.now())
+    existing = store.pending_events()[0]
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.inject_event(
+            OutboxEvent(
+                event_id=existing.event_id,
+                event_type=IntegrationEventType.ACTION_ACCEPTED,
+                schema_version=1,
+                aggregate_id="agg_other",
+                aggregate_version=1,
+                action_id="act_other",
+                client_request_id="cli_other",
+                correlation_id="cor_other",
+                command_id="cmd_other",
+                causation_id=None,
+                payload={"action_id": "act_other", "status": "PENDING", "projection_id": "today"},
+                state=OutboxState.PENDING,
+                parked_at=None,
+            )
+        )
+
+
+def test_a_duplicate_aggregate_version_is_not_mistaken_for_a_duplicate_request(
+    tmp_path: Path,
+) -> None:
+    kernel, store, _guardian, _provider, clock = make_kernel(tmp_path)
+    action_id = accept(kernel, clock.now())
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.inject_event(
+            OutboxEvent(
+                event_id="evt_clash",
+                event_type=IntegrationEventType.ACTION_ACCEPTED,
+                schema_version=1,
+                aggregate_id=action_id,
+                aggregate_version=1,
+                action_id=action_id,
+                client_request_id="cli_1",
+                correlation_id="cor_1",
+                command_id="cmd_1",
+                causation_id=None,
+                payload={"action_id": action_id, "status": "PENDING", "projection_id": "today"},
+                state=OutboxState.PENDING,
+                parked_at=None,
+            )
+        )

@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict
 from wplos.integration.specs import (
     ActionSpec,
     ConsumerRegistry,
+    IntegrationEventType,
     ReauthorizationExpiryPolicy,
 )
 from wplos.integration.store import (
@@ -21,14 +22,11 @@ from wplos.integration.store import (
     SQLiteIntegrationStore,
     StoredAction,
 )
-from wplos.policy.decisions import PolicyOutcome, ReasonCode
+from wplos.policy.decisions import PolicyDecision, PolicyOutcome, ReasonCode
 from wplos.policy.execution import ExecutionAuthorization, ExecutionPolicy, ProposedAction
 from wplos.policy.guardian import GuardianAssessment, GuardianVerdict
 from wplos.policy.guardian_authority import GuardianAuthority
 
-ACTION_ACCEPTED = "ACTION_ACCEPTED"
-ACTION_SUCCEEDED = "ACTION_SUCCEEDED"
-ACTION_FAILED = "ACTION_FAILED"
 EVENT_SCHEMA_VERSION = 1
 
 
@@ -158,7 +156,7 @@ class WalkingSkeleton:
             command_id=command_id,
             external_reference=self._id("ext"),
             event_id=event_id,
-            event_type=ACTION_ACCEPTED,
+            event_type=IntegrationEventType.ACTION_ACCEPTED,
             schema_version=EVENT_SCHEMA_VERSION,
             payload={
                 "action_id": str(action.action_id),
@@ -168,9 +166,23 @@ class WalkingSkeleton:
         )
 
     def execute(self, action_id: str) -> ActionStatus:
+        """Claim the action, then decide, then act.
+
+        The claim comes first for two reasons. It is the only thing that makes
+        exactly one worker proceed, and it means Guardian is consulted once by
+        the winner rather than once per racer — two assessments of the same
+        action retire each other, so the loser's verdict would arrive stale
+        through no fault of its own.
+        """
         stored = self._require_action(action_id)
         if stored.status.is_terminal:
             return stored.status
+        if not self.store.claim_for_processing(action_id):
+            return self._require_action(action_id).status
+
+        # Re-read under ownership: the terms may have moved between the first
+        # look and the claim.
+        stored = self._require_action(action_id)
         now = self.clock.now()
         action = stored.proposed_action
         current_guardian = self.guardian.assess(action, now)
@@ -181,29 +193,33 @@ class WalkingSkeleton:
             now,
         )
         if decision.outcome is not PolicyOutcome.PERMIT:
-            if decision.has_reason(ReasonCode.GUARDIAN_BLOCKED):
-                return self._settle(stored, ActionStatus.BLOCKED, ACTION_FAILED)
-            if decision.outcome is PolicyOutcome.REQUIRE_CONFIRMATION or decision.has_reason(
-                ReasonCode.MATERIAL_TERMS_CHANGED
-            ):
-                spec = self.specs[stored.spec_name]
-                expiry = now + timedelta(seconds=spec.reauthorization_ttl_seconds)
-                self.store.update_action_status(
-                    action_id,
-                    ActionStatus.REAUTHORIZATION_REQUIRED,
-                    reauthorization_expires_at=expiry,
-                )
-                return ActionStatus.REAUTHORIZATION_REQUIRED
-            return self._settle(stored, ActionStatus.BLOCKED, ACTION_FAILED)
+            return self._refuse(stored, decision, now)
 
-        self.store.update_action_status(action_id, ActionStatus.PROCESSING)
         result = self.provider.execute(action, stored.external_reference)
         if result.outcome is ProviderOutcome.TIMEOUT:
             self.store.update_action_status(action_id, ActionStatus.UNKNOWN)
             return ActionStatus.UNKNOWN
         if result.outcome is ProviderOutcome.FAILED:
-            return self._settle(stored, ActionStatus.FAILED, ACTION_FAILED)
-        return self._settle(stored, ActionStatus.SUCCEEDED, ACTION_SUCCEEDED)
+            return self._settle(stored, ActionStatus.FAILED, IntegrationEventType.ACTION_FAILED)
+        return self._settle(stored, ActionStatus.SUCCEEDED, IntegrationEventType.ACTION_SUCCEEDED)
+
+    def _refuse(
+        self, stored: StoredAction, decision: PolicyDecision, now: datetime
+    ) -> ActionStatus:
+        if decision.has_reason(ReasonCode.GUARDIAN_BLOCKED):
+            return self._settle(stored, ActionStatus.BLOCKED, IntegrationEventType.ACTION_FAILED)
+        if decision.outcome is PolicyOutcome.REQUIRE_CONFIRMATION or decision.has_reason(
+            ReasonCode.MATERIAL_TERMS_CHANGED
+        ):
+            spec = self.specs[stored.spec_name]
+            expiry = now + timedelta(seconds=spec.reauthorization_ttl_seconds)
+            self.store.update_action_status(
+                stored.action_id,
+                ActionStatus.REAUTHORIZATION_REQUIRED,
+                reauthorization_expires_at=expiry,
+            )
+            return ActionStatus.REAUTHORIZATION_REQUIRED
+        return self._settle(stored, ActionStatus.BLOCKED, IntegrationEventType.ACTION_FAILED)
 
     def reconcile_unknown(self, action_id: str) -> ActionStatus:
         stored = self._require_action(action_id)
@@ -217,9 +233,11 @@ class WalkingSkeleton:
             return ActionStatus.NEEDS_ATTENTION
         outcome = self.provider.lookup(stored.external_reference)
         if outcome is LookupOutcome.SUCCEEDED:
-            return self._settle(stored, ActionStatus.SUCCEEDED, ACTION_SUCCEEDED)
+            return self._settle(
+                stored, ActionStatus.SUCCEEDED, IntegrationEventType.ACTION_SUCCEEDED
+            )
         if outcome is LookupOutcome.FAILED:
-            return self._settle(stored, ActionStatus.FAILED, ACTION_FAILED)
+            return self._settle(stored, ActionStatus.FAILED, IntegrationEventType.ACTION_FAILED)
         if outcome is LookupOutcome.NOT_FOUND and self.provider.supports_idempotency:
             self.store.update_action_status(action_id, ActionStatus.PENDING)
             return ActionStatus.PENDING
@@ -251,17 +269,16 @@ class WalkingSkeleton:
             if not handlers:
                 self.store.mark_event_state(event.event_id, OutboxState.APPLIED)
                 continue
-            if self._has_gap(event, handlers):
-                if event.parked_at is not None and now - event.parked_at >= gap_timeout:
-                    self.store.mark_event_state(event.event_id, OutboxState.NEEDS_ATTENTION)
-                elif event.state is not OutboxState.PARKED_FOR_GAP:
-                    self.store.mark_event_state(
-                        event.event_id, OutboxState.PARKED_FOR_GAP, parked_at=now
-                    )
+            if self._blocked_by_gap(event, handlers):
+                self._park(event, now, gap_timeout)
                 continue
             payload = ActionLifecyclePayload.tolerant(event.payload)
             normalized = payload.model_dump()
             for consumer_name, handler in handlers:
+                if not self._is_next_for(consumer_name, event):
+                    # This consumer is already past this version: the delivery is a
+                    # replay, and the durable dedupe key has already recorded it.
+                    continue
                 effect = handler(normalized)
                 self.store.apply_once(
                     consumer_name=consumer_name,
@@ -270,22 +287,52 @@ class WalkingSkeleton:
                 )
             self.store.mark_event_state(event.event_id, OutboxState.APPLIED)
 
-    def _has_gap(
+    def _park(self, event: OutboxEvent, now: datetime, gap_timeout: timedelta) -> None:
+        if event.parked_at is not None and now - event.parked_at >= gap_timeout:
+            self.store.mark_event_state(event.event_id, OutboxState.NEEDS_ATTENTION)
+        elif event.state is not OutboxState.PARKED_FOR_GAP:
+            self.store.mark_event_state(event.event_id, OutboxState.PARKED_FOR_GAP, parked_at=now)
+
+    def _blocked_by_gap(
         self,
         event: OutboxEvent,
         handlers: tuple[tuple[str, object], ...],
     ) -> bool:
-        for consumer_name, _handler in handlers:
-            expected = self.store.last_consumer_version(consumer_name, event.aggregate_id) + 1
-            if event.aggregate_version != expected:
-                return True
-        return False
+        """True only when a consumer is still waiting for an earlier version.
 
-    def _settle(self, stored: StoredAction, status: ActionStatus, event_type: str) -> ActionStatus:
+        Three cases, and only one of them is a gap. A version *ahead* of what a
+        consumer expects means something earlier has not arrived, so the event
+        waits. A version *behind* is a redelivery, which must reach the durable
+        dedupe rather than be parked forever. Treating both as gaps is what made
+        an ordinary duplicate look like a hole in the stream.
+        """
+        return any(
+            event.aggregate_version > self._expected_for(consumer_name, event)
+            for consumer_name, _handler in handlers
+        )
+
+    def _expected_for(self, consumer_name: str, event: OutboxEvent) -> int:
+        return self.store.last_consumer_version(consumer_name, event.aggregate_id) + 1
+
+    def _is_next_for(self, consumer_name: str, event: OutboxEvent) -> bool:
+        """Whether this consumer still owes this version.
+
+        Consumers advance independently, so one failing after another succeeded
+        must be able to catch up on a retry instead of the event parking.
+        """
+        return event.aggregate_version == self._expected_for(consumer_name, event)
+
+    def _settle(
+        self,
+        stored: StoredAction,
+        status: ActionStatus,
+        event_type: IntegrationEventType,
+    ) -> ActionStatus:
         causation_id = self.store.last_event_id(stored.action_id)
         self.store.settle_action_with_event(
             action_id=stored.action_id,
             status=status,
+            projection_id=stored.projection_id,
             event_id=self._id("evt"),
             event_type=event_type,
             schema_version=EVENT_SCHEMA_VERSION,

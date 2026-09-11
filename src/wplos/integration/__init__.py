@@ -1,7 +1,4 @@
 from wplos.integration.kernel import (
-    ACTION_ACCEPTED,
-    ACTION_FAILED,
-    ACTION_SUCCEEDED,
     ActionLifecyclePayload,
     ExternalProvider,
     LookupOutcome,
@@ -16,13 +13,16 @@ from wplos.integration.specs import (
     ConsumerRegistry,
     EventSpec,
     ExecutionMode,
+    IntegrationEventType,
     OfflinePolicy,
     OrderingPolicy,
     PostCommitFailurePolicy,
     ReauthorizationExpiryPolicy,
 )
 from wplos.integration.store import (
+    ALLOWED_FROM,
     ActionStatus,
+    IllegalTransition,
     OutboxEvent,
     OutboxState,
     ProjectionState,
@@ -31,9 +31,7 @@ from wplos.integration.store import (
 )
 
 __all__ = [
-    "ACTION_ACCEPTED",
-    "ACTION_FAILED",
-    "ACTION_SUCCEEDED",
+    "ALLOWED_FROM",
     "ActionLifecyclePayload",
     "ActionSpec",
     "ActionStatus",
@@ -42,6 +40,8 @@ __all__ = [
     "EventSpec",
     "ExecutionMode",
     "ExternalProvider",
+    "IllegalTransition",
+    "IntegrationEventType",
     "LookupOutcome",
     "MutableGuardian",
     "OfflinePolicy",

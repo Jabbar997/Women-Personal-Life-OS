@@ -49,6 +49,7 @@ LAYERS: dict[str, int] = {
     "agents": 5,
     "orchestration": 6,
     "application": 7,
+    "integration": 8,
 }
 
 
@@ -109,6 +110,27 @@ def test_layering_only_points_one_way() -> None:
                 violations.append(f"{relative} imports wplos.{imported}")
 
     assert not violations, violations
+
+
+def test_nothing_below_integration_may_import_it() -> None:
+    """The integration kernel is the outermost layer.
+
+    It may lean on the domain and the runtime; nothing they contain may reach
+    back into sqlite, the outbox or the worker. Without a rank in LAYERS the
+    one-way rule silently skipped the package entirely.
+    """
+    assert LAYERS["integration"] > LAYERS["application"]
+
+    offenders: list[str] = []
+    for module in _modules():
+        relative = module.relative_to(SRC)
+        layer = relative.parts[0] if len(relative.parts) > 1 else None
+        if layer is None or layer == "integration":
+            continue
+        if "integration" in _wplos_imports(module):
+            offenders.append(relative.as_posix())
+
+    assert not offenders, offenders
 
 
 def test_no_user_interface_has_been_built() -> None:

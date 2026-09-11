@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
+from wplos.integration.specs import IntegrationEventType
 from wplos.policy.execution import ExecutionAuthorization, ProposedAction
 
 
@@ -32,6 +33,53 @@ class ActionStatus(StrEnum):
             ActionStatus.BLOCKED,
             ActionStatus.CANCELLED,
         }
+
+
+ALLOWED_FROM: dict[ActionStatus, frozenset[ActionStatus]] = {
+    ActionStatus.PROCESSING: frozenset(
+        {ActionStatus.PENDING, ActionStatus.REAUTHORIZATION_REQUIRED}
+    ),
+    ActionStatus.SUCCEEDED: frozenset({ActionStatus.PROCESSING, ActionStatus.UNKNOWN}),
+    ActionStatus.FAILED: frozenset({ActionStatus.PROCESSING, ActionStatus.UNKNOWN}),
+    ActionStatus.UNKNOWN: frozenset({ActionStatus.PROCESSING}),
+    ActionStatus.REAUTHORIZATION_REQUIRED: frozenset(
+        {
+            ActionStatus.PENDING,
+            ActionStatus.PROCESSING,
+            ActionStatus.REAUTHORIZATION_REQUIRED,
+        }
+    ),
+    ActionStatus.BLOCKED: frozenset(
+        {
+            ActionStatus.PENDING,
+            ActionStatus.PROCESSING,
+            ActionStatus.REAUTHORIZATION_REQUIRED,
+            ActionStatus.UNKNOWN,
+        }
+    ),
+    ActionStatus.NEEDS_ATTENTION: frozenset(
+        {
+            ActionStatus.PROCESSING,
+            ActionStatus.UNKNOWN,
+            ActionStatus.REAUTHORIZATION_REQUIRED,
+        }
+    ),
+    ActionStatus.CANCELLED: frozenset(
+        {ActionStatus.PENDING, ActionStatus.REAUTHORIZATION_REQUIRED}
+    ),
+    ActionStatus.PENDING: frozenset({ActionStatus.UNKNOWN, ActionStatus.REAUTHORIZATION_REQUIRED}),
+}
+"""Which statuses a target may legally be reached from.
+
+Every terminal status is absent from the value sets, so SUCCEEDED -> PENDING,
+FAILED -> PROCESSING and CANCELLED -> PENDING cannot be expressed. The guard is
+carried in the UPDATE's WHERE clause rather than checked beforehand, because a
+check that happens before the write is a check two workers can both pass.
+"""
+
+
+class IllegalTransition(RuntimeError):
+    """A status change the state machine does not permit, or lost to a racer."""
 
 
 class OutboxState(StrEnum):
@@ -60,7 +108,7 @@ class StoredAction:
 @dataclass(frozen=True, slots=True)
 class OutboxEvent:
     event_id: str
-    event_type: str
+    event_type: IntegrationEventType
     schema_version: int
     aggregate_id: str
     aggregate_version: int
@@ -72,6 +120,7 @@ class OutboxEvent:
     payload: dict[str, object]
     state: OutboxState
     parked_at: datetime | None
+    projection_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,16 +129,27 @@ class ProjectionState:
     last_applied_event_id: str | None
     updated_at: datetime | None
     active_action_ids: tuple[str, ...]
+    unapplied_event_ids: tuple[str, ...] = ()
 
     @property
     def is_stale(self) -> bool:
-        return bool(self.active_action_ids)
+        """Fresh means nothing is still coming *and* everything has landed.
+
+        An action reaching SUCCEEDED does not make the projection current: its
+        result event is still sitting in the outbox, so a reader would be told
+        the view is up to date while it still shows the old state.
+        """
+        return bool(self.active_action_ids) or bool(self.unapplied_event_ids)
 
 
 def _dt(value: str | None) -> datetime | None:
     if value is None:
         return None
     return datetime.fromisoformat(value)
+
+
+def _placeholders(values: frozenset[ActionStatus]) -> str:
+    return ",".join("?" for _ in values)
 
 
 def _now_iso() -> str:
@@ -140,6 +200,7 @@ class SQLiteIntegrationStore:
                     event_id TEXT PRIMARY KEY,
                     event_type TEXT NOT NULL,
                     schema_version INTEGER NOT NULL,
+                    projection_id TEXT,
                     aggregate_id TEXT NOT NULL,
                     aggregate_version INTEGER NOT NULL,
                     action_id TEXT NOT NULL,
@@ -212,50 +273,63 @@ class SQLiteIntegrationStore:
         command_id: str,
         external_reference: str,
         event_id: str,
-        event_type: str,
+        event_type: IntegrationEventType,
         schema_version: int,
         payload: dict[str, object],
     ) -> tuple[StoredAction, bool]:
+        """Write the action and its first event in one transaction.
+
+        Only a clash on ``(user_id, client_request_id)`` means "I have seen this
+        request before". Every other integrity error — a reused action id, a
+        reused event id, a duplicate aggregate version — is a bug, and
+        swallowing it as a duplicate would hide the bug and silently drop the
+        outbox event with it.
+        """
         now = _now_iso()
-        try:
-            with self.transaction() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO actions(
-                        action_id,user_id,client_request_id,status,spec_name,projection_id,
-                        proposed_action_json,authorization_json,correlation_id,command_id,
-                        external_reference,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        str(action.action_id),
-                        str(action.owner_id),
-                        client_request_id,
-                        ActionStatus.PENDING,
-                        spec_name,
-                        projection_id,
-                        action.model_dump_json(),
-                        None if authorization is None else authorization.model_dump_json(),
-                        correlation_id,
-                        command_id,
-                        external_reference,
-                        now,
-                        now,
-                    ),
-                )
+        duplicate = False
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO actions(
+                    action_id,user_id,client_request_id,status,spec_name,projection_id,
+                    proposed_action_json,authorization_json,correlation_id,command_id,
+                    external_reference,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(user_id, client_request_id) DO NOTHING
+                """,
+                (
+                    str(action.action_id),
+                    str(action.owner_id),
+                    client_request_id,
+                    ActionStatus.PENDING,
+                    spec_name,
+                    projection_id,
+                    action.model_dump_json(),
+                    None if authorization is None else authorization.model_dump_json(),
+                    correlation_id,
+                    command_id,
+                    external_reference,
+                    now,
+                    now,
+                ),
+            )
+            if cursor.rowcount == 0:
+                duplicate = True
+            else:
                 version = self.next_aggregate_version(connection, str(action.action_id))
                 connection.execute(
                     """
                     INSERT INTO outbox(
-                        event_id,event_type,schema_version,aggregate_id,aggregate_version,
-                        action_id,client_request_id,correlation_id,command_id,causation_id,
-                        payload_json,state,created_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        event_id,event_type,schema_version,projection_id,aggregate_id,
+                        aggregate_version,action_id,client_request_id,correlation_id,
+                        command_id,causation_id,payload_json,state,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         event_id,
                         event_type,
                         schema_version,
+                        projection_id,
                         str(action.action_id),
                         version,
                         str(action.action_id),
@@ -268,44 +342,65 @@ class SQLiteIntegrationStore:
                         now,
                     ),
                 )
-        except sqlite3.IntegrityError:
+        if duplicate:
             existing = self.get_by_client_request(str(action.owner_id), client_request_id)
             if existing is None:
-                raise
+                raise RuntimeError("conflicting request vanished before it could be read")
             return existing, False
         stored = self.get_action(str(action.action_id))
         if stored is None:
             raise RuntimeError("action disappeared after committed insert")
         return stored, True
 
-    def append_event(
+    def settle_action_with_event(
         self,
         *,
-        event_id: str,
-        event_type: str,
-        schema_version: int,
         action_id: str,
+        status: ActionStatus,
+        allowed_from: frozenset[ActionStatus] | None = None,
+        projection_id: str,
+        event_id: str,
+        event_type: IntegrationEventType,
+        schema_version: int,
         client_request_id: str,
         correlation_id: str,
         command_id: str,
         causation_id: str | None,
         payload: dict[str, object],
     ) -> None:
+        """Persist the terminal state and its result event atomically.
+
+        The transition guard lives in the WHERE clause, so a settle that races
+        another worker loses in the database rather than overwriting it.
+        """
+        sources = ALLOWED_FROM[status] if allowed_from is None else allowed_from
         now = _now_iso()
         with self.transaction() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE actions SET status=?, updated_at=?
+                WHERE action_id=? AND status IN ({_placeholders(sources)})
+                """,
+                (status, now, action_id, *sorted(sources)),
+            )
+            if cursor.rowcount != 1:
+                raise IllegalTransition(
+                    f"{action_id} cannot become {status} from its current state"
+                )
             version = self.next_aggregate_version(connection, action_id)
             connection.execute(
                 """
                 INSERT INTO outbox(
-                    event_id,event_type,schema_version,aggregate_id,aggregate_version,
-                    action_id,client_request_id,correlation_id,command_id,causation_id,
-                    payload_json,state,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    event_id,event_type,schema_version,projection_id,aggregate_id,
+                    aggregate_version,action_id,client_request_id,correlation_id,
+                    command_id,causation_id,payload_json,state,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     event_id,
                     event_type,
                     schema_version,
+                    projection_id,
                     action_id,
                     version,
                     action_id,
@@ -319,52 +414,43 @@ class SQLiteIntegrationStore:
                 ),
             )
 
-    def settle_action_with_event(
+    def claim_for_processing(self, action_id: str) -> bool:
+        """Take exclusive ownership of an action, or lose the race.
+
+        A conditional UPDATE inside BEGIN IMMEDIATE is the whole mechanism: two
+        workers both reach here, both attempt it, and exactly one changes a row.
+        Nothing here depends on a process-level lock, so it still holds when the
+        workers are separate processes or separate machines.
+        """
+        return self._transition(action_id, ActionStatus.PROCESSING)
+
+    def _transition(
         self,
-        *,
         action_id: str,
         status: ActionStatus,
-        event_id: str,
-        event_type: str,
-        schema_version: int,
-        client_request_id: str,
-        correlation_id: str,
-        command_id: str,
-        causation_id: str | None,
-        payload: dict[str, object],
-    ) -> None:
-        """Persist the terminal state and its result event atomically."""
-        now = _now_iso()
+        *,
+        reauthorization_expires_at: datetime | None = None,
+    ) -> bool:
+        sources = ALLOWED_FROM[status]
         with self.transaction() as connection:
-            connection.execute(
-                "UPDATE actions SET status=?, updated_at=? WHERE action_id=?",
-                (status, now, action_id),
-            )
-            version = self.next_aggregate_version(connection, action_id)
-            connection.execute(
-                """
-                INSERT INTO outbox(
-                    event_id,event_type,schema_version,aggregate_id,aggregate_version,
-                    action_id,client_request_id,correlation_id,command_id,causation_id,
-                    payload_json,state,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            cursor = connection.execute(
+                f"""
+                UPDATE actions SET status=?, reauthorization_expires_at=?, updated_at=?
+                WHERE action_id=? AND status IN ({_placeholders(sources)})
                 """,
                 (
-                    event_id,
-                    event_type,
-                    schema_version,
+                    status,
+                    (
+                        None
+                        if reauthorization_expires_at is None
+                        else reauthorization_expires_at.isoformat()
+                    ),
+                    _now_iso(),
                     action_id,
-                    version,
-                    action_id,
-                    client_request_id,
-                    correlation_id,
-                    command_id,
-                    causation_id,
-                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
-                    OutboxState.PENDING,
-                    now,
+                    *sorted(sources),
                 ),
             )
+            return cursor.rowcount == 1
 
     def last_event_id(self, action_id: str) -> str | None:
         with self._connect() as connection:
@@ -383,15 +469,16 @@ class SQLiteIntegrationStore:
             connection.execute(
                 """
                 INSERT INTO outbox(
-                    event_id,event_type,schema_version,aggregate_id,aggregate_version,
-                    action_id,client_request_id,correlation_id,command_id,causation_id,
-                    payload_json,state,parked_at,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    event_id,event_type,schema_version,projection_id,aggregate_id,
+                    aggregate_version,action_id,client_request_id,correlation_id,
+                    command_id,causation_id,payload_json,state,parked_at,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     event.event_id,
                     event.event_type,
                     event.schema_version,
+                    event.projection_id,
                     event.aggregate_id,
                     event.aggregate_version,
                     event.action_id,
@@ -435,23 +522,10 @@ class SQLiteIntegrationStore:
         *,
         reauthorization_expires_at: datetime | None = None,
     ) -> None:
-        with self.transaction() as connection:
-            connection.execute(
-                """
-                UPDATE actions SET status=?, reauthorization_expires_at=?, updated_at=?
-                WHERE action_id=?
-                """,
-                (
-                    status,
-                    (
-                        None
-                        if reauthorization_expires_at is None
-                        else reauthorization_expires_at.isoformat()
-                    ),
-                    _now_iso(),
-                    action_id,
-                ),
-            )
+        if not self._transition(
+            action_id, status, reauthorization_expires_at=reauthorization_expires_at
+        ):
+            raise IllegalTransition(f"{action_id} cannot become {status} from its current state")
 
     def update_action_terms(self, action: ProposedAction) -> None:
         with self.transaction() as connection:
@@ -525,7 +599,8 @@ class SQLiteIntegrationStore:
                 INSERT INTO consumer_offsets(consumer_name,aggregate_id,last_version)
                 VALUES(?,?,?)
                 ON CONFLICT(consumer_name,aggregate_id)
-                DO UPDATE SET last_version=excluded.last_version
+                DO UPDATE SET last_version=MAX(consumer_offsets.last_version,
+                                               excluded.last_version)
                 """,
                 (consumer_name, event.aggregate_id, event.aggregate_version),
             )
@@ -550,6 +625,14 @@ class SQLiteIntegrationStore:
             active_rows = connection.execute(
                 "SELECT action_id,status FROM actions WHERE projection_id=?", (projection_id,)
             ).fetchall()
+            unapplied_rows = connection.execute(
+                """
+                SELECT event_id FROM outbox
+                WHERE projection_id=? AND state IN (?,?)
+                ORDER BY aggregate_id, aggregate_version
+                """,
+                (projection_id, OutboxState.PENDING, OutboxState.PARKED_FOR_GAP),
+            ).fetchall()
         active = tuple(
             str(item["action_id"])
             for item in active_rows
@@ -564,6 +647,7 @@ class SQLiteIntegrationStore:
             last_applied_event_id=None if applied is None else str(applied),
             updated_at=None if row is None else _dt(row["updated_at"]),
             active_action_ids=active,
+            unapplied_event_ids=tuple(str(item["event_id"]) for item in unapplied_rows),
         )
 
     def processed_count(self, consumer_name: str, event_id: str) -> int:
@@ -615,7 +699,7 @@ class SQLiteIntegrationStore:
         payload: dict[str, object] = {str(key): value for key, value in raw_payload.items()}
         return OutboxEvent(
             event_id=str(row["event_id"]),
-            event_type=str(row["event_type"]),
+            event_type=IntegrationEventType(str(row["event_type"])),
             schema_version=int(row["schema_version"]),
             aggregate_id=str(row["aggregate_id"]),
             aggregate_version=int(row["aggregate_version"]),
@@ -627,4 +711,5 @@ class SQLiteIntegrationStore:
             payload=payload,
             state=OutboxState(str(row["state"])),
             parked_at=_dt(row["parked_at"]),
+            projection_id=(None if row["projection_id"] is None else str(row["projection_id"])),
         )
