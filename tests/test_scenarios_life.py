@@ -27,6 +27,7 @@ from wplos.events.bus import InMemoryEventBus
 from wplos.events.payloads import (
     CalendarConflictPayload,
     CalendarEventPayload,
+    CaptureKind,
     CaptureParsedPayload,
     CapturePayload,
     CaptureRoutedPayload,
@@ -57,6 +58,7 @@ from wplos.personal_life_graph.attributes import (
     IngredientFlag,
     InterestAttributes,
     Kinship,
+    LocationPrecision,
     OpenLoopState,
     PersonAttributes,
     PlaceAttributes,
@@ -278,7 +280,7 @@ def test_scenario_02_school_trip_screenshot(
     received = bus.publish(
         emit(
             EventType.CAPTURE_RECEIVED,
-            CapturePayload(capture_id="cap_school", channel="screenshot"),
+            CapturePayload(capture_id="cap_school", kind=CaptureKind.SCREENSHOT),
             owner,
             now,
             source_type=SourceType.USER_ACTION,
@@ -349,7 +351,7 @@ def test_scenario_03_return_window_keeps_the_delivery_date(
         delivered,
         EntityType.PURCHASE,
         "Leather bag",
-        PurchaseAttributes(currency="SAR", returnable_until=window_closes, merchant="a boutique"),
+        PurchaseAttributes(returnable_until=window_closes, merchant="a boutique"),
         markers=TemporalMarkers(occurred_at=delivered),
     )
     loop = declare(
@@ -375,7 +377,7 @@ def test_scenario_03_return_window_keeps_the_delivery_date(
     assert versions[1].attributes_as(CommitmentAttributes).state is OpenLoopState.DUE
     assert versions[1].markers.due_at == window_closes
     assert graph.get_entity(purchase.id).markers.occurred_at == delivered
-    assert purchase.attributes_as(PurchaseAttributes).amount_minor is None
+    assert purchase.attributes_as(PurchaseAttributes).amount is None
 
     bus = InMemoryEventBus()
     recorded = bus.publish(
@@ -773,7 +775,13 @@ def test_scenario_09_radar_gets_the_city_and_nothing_else(
         now,
         EntityType.PLACE,
         "Home",
-        PlaceAttributes(city="Riyadh", street_address="a specific street", is_home=True),
+        PlaceAttributes(
+            city="Riyadh",
+            area="Al Nakheel",
+            street_address="a specific street",
+            latitude=24.7,
+            is_home=True,
+        ),
         sensitivity=SensitivityLevel.S3,
     )
     declare(
@@ -809,12 +817,21 @@ def test_scenario_09_radar_gets_the_city_and_nothing_else(
     assert EntityType.PREGNANCY_STATE not in delivered
     assert EntityType.HEALTH_CONDITION not in delivered
 
-    # The area reaches Radar; the exact address never does.
-    assert area.id in {entity.id for entity in view.entities}
-    assert home.id not in {entity.id for entity in view.entities}
+    # The area reaches Radar whole; the home place reaches it with its precise
+    # fields stripped, rather than being lost entirely or leaking.
+    delivered_by_id = {entity.id: entity for entity in view.entities}
+    assert area.id in delivered_by_id
     assert all(entity.sensitivity.rank <= SensitivityLevel.S2.rank for entity in view.entities)
+
+    seen_home = delivered_by_id.get(home.id)
+    assert seen_home is not None
+    home_attributes = seen_home.attributes_as(PlaceAttributes)
+    assert home_attributes.city == "Riyadh"
+    assert home_attributes.street_address is None
+    assert home_attributes.latitude is None
+    assert home_attributes.precision is LocationPrecision.AREA
+    assert seen_home.redacted_fields >= {"street_address"}
     assert view.was_redacted
-    assert all(redaction.count >= 1 for redaction in view.redactions)
 
 
 def test_scenario_09_an_address_cannot_be_stored_below_s3(
@@ -968,7 +985,7 @@ def test_scenario_10_one_long_day_becomes_one_coordinated_answer(
     root = bus.publish(
         emit(
             EventType.CAPTURE_RECEIVED,
-            CapturePayload(capture_id="cap_day", channel="chat"),
+            CapturePayload(capture_id="cap_day", kind=CaptureKind.TEXT),
             owner,
             now,
             source_type=SourceType.USER_DECLARED,

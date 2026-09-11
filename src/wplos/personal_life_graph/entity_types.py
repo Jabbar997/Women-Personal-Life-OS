@@ -54,6 +54,7 @@ class EntityType(StrEnum):
     DOCUMENT = "DOCUMENT"
     RADAR_ITEM = "RADAR_ITEM"
     BEHAVIOR_PATTERN = "BEHAVIOR_PATTERN"
+    REQUIREMENT = "REQUIREMENT"
 
 
 class LifeDomain(StrEnum):
@@ -103,6 +104,7 @@ DOMAIN_OF: dict[EntityType, LifeDomain] = {
     EntityType.DOCUMENT: LifeDomain.HOME,
     EntityType.RADAR_ITEM: LifeDomain.WORLD,
     EntityType.BEHAVIOR_PATTERN: LifeDomain.IDENTITY,
+    EntityType.REQUIREMENT: LifeDomain.TIME,
 }
 
 DEFAULT_SENSITIVITY: dict[EntityType, SensitivityLevel] = {
@@ -136,6 +138,7 @@ DEFAULT_SENSITIVITY: dict[EntityType, SensitivityLevel] = {
     EntityType.DOCUMENT: SensitivityLevel.S2,
     EntityType.RADAR_ITEM: SensitivityLevel.S0,
     EntityType.BEHAVIOR_PATTERN: SensitivityLevel.S2,
+    EntityType.REQUIREMENT: SensitivityLevel.S1,
 }
 
 

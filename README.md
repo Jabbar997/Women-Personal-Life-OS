@@ -6,10 +6,14 @@ minds and an orchestrator on the inside.
 It is not a period tracker, a beauty app, a planner, a deals app, a generic AI
 chatbot, or a super-app stitched together from separate features.
 
-> **Current phase: Phase 01 — Domain Foundation.**
+> **Current phase: domain foundation, adversarially validated.**
 > This repository contains the domain core only: the Personal Life Graph, the
 > event model, the agent contracts and the policy primitives. There is no UI, no
 > API, no LLM integration and no database yet, by design.
+>
+> The product is a native-feeling iOS and Android application. The client is not
+> built yet, and when it is, it will be a presentation and cache layer: the
+> domain stays server-side and stays the authority.
 
 ## The six minds
 
@@ -83,6 +87,7 @@ test suite. All four must pass before anything is pushed.
 | [`docs/domain/agent-authority-matrix.md`](docs/domain/agent-authority-matrix.md) | Who may read, write, propose, veto and execute. Generated from the contracts. |
 | [`docs/domain/agent-handoffs.md`](docs/domain/agent-handoffs.md) | The permitted passes of work between minds. |
 | [`docs/validation/foundation-validation-01.md`](docs/validation/foundation-validation-01.md) | The ten-scenario life simulation and what it broke. |
+| [`docs/validation/adversarial-validation-v3.md`](docs/validation/adversarial-validation-v3.md) | Thirty adversarial scenarios, mobile readiness, and the gaps they closed. |
 | [`docs/adr/`](docs/adr/) | Architecture decision records. |
 
 ## Licence

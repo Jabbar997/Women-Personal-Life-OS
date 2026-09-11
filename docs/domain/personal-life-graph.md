@@ -68,9 +68,25 @@ Primitives, not one table per topic:
 | Preferences | `MemoryType.PREFERENCE` |
 | Behavioral History | `BEHAVIOR_PATTERN` + `MemoryType.BEHAVIOR` + the event log |
 | Events (system) | domain events, see `event-model.md` |
+| Event requirements | `REQUIREMENT` with `RequirementKind` and `RequirementStatus` |
+| Money | `Money`, integer minor units plus a currency |
 
 `INGREDIENT`, `AVAILABILITY_STATE`, `DOCUMENT` and `RADAR_ITEM` round out the
 required relationship shapes.
+
+### Requirements and money
+
+A `REQUIREMENT` is one thing an event needs: an item, an outfit, a document or
+money. `RequirementKind` separates carrying cash on the day from paying ahead,
+an entry fee and a purchase, because those are different obligations with
+different deadlines. Money is a `Money` value — integer minor units and a
+currency, never a float and never a number inside a headline — and the same
+primitive carries a Radar price, a purchase, a subscription and an Operator
+material term.
+
+`RequirementStatus` closes the loop when a dependency breaks: the gown going to
+the laundry moves the requirement to `AT_RISK`, which `blocks_readiness`, and
+emits `REQUIREMENT_STATUS_CHANGED` carrying the previous status and the cause.
 
 ## 4. Relationships
 
@@ -91,6 +107,7 @@ GOAL   SUPPORTED_BY   COURSE
 PERSON RELATED_TO     PERSON      (symmetric)
 ITEM   HAS_STATUS     AVAILABILITY_STATE
 EVENT  CONFLICTS_WITH EVENT       (symmetric)
+EVENT  REQUIRES       REQUIREMENT
 ```
 
 `CONFLICTS_WITH` makes a clash between two commitments durable state rather than
@@ -112,7 +129,11 @@ Three clocks, never collapsed into one:
 | Domain time | `occurred_at`, `scheduled_for`, `due_at`, `completed_at` | when does the world do it? |
 
 A calendar event's start is its `scheduled_for` marker; only the end of the
-interval lives in attributes. Naive datetimes are rejected at the boundary:
+interval lives in attributes, along with the IANA `time_zone` the event is
+anchored to. `ZonedInstant` keeps an instant and its zone together: an
+appointment at 09:00 in Riyadh is still at 09:00 in Riyadh after she lands in
+London, and a local time that falls in a DST gap or fold is refused unless the
+caller states which reading was meant. Naive datetimes are rejected at the boundary:
 ambiguous time is a correctness bug, and time arithmetic is a rules concern.
 
 ## 6. Closing a record: wrong versus no longer true
@@ -126,6 +147,7 @@ mix:
 | `SUPERSEDED` | was true, replaced | yes |
 | `EXPIRED` | was true, its time ran out | yes |
 | `ARCHIVED` | was true, moved out of the working set | yes |
+| `SUPPRESSED` | true, audited, not to be mentioned | yes, but never surfaced |
 | `INVALIDATED` | was never true; we were wrong | **no** |
 
 Only `INVALIDATED` is retroactive (`RecordStatus.negates_history`). Everything
@@ -133,9 +155,16 @@ else stays visible to an as-of query, so closing a record today does not rewrite
 what the graph says about last month. `is_active_at(at)` asks "was this in force
 then", not "is this the current row".
 
-For memories the two are separate methods: `superseded()` when she changed, and
-`invalidated()` when the system was wrong. Using the wrong one is a
-history-integrity bug, not a naming preference.
+For memories these are separate methods: `superseded()` when she changed,
+`invalidated()` when the system was wrong, and `suppressed()` when she asked us
+not to bring something up. "Don't mention this" is a display decision; it is
+neither a claim that the thing is untrue nor a request to erase it. Using the
+wrong one is a history-integrity bug, not a naming preference.
+
+Records also carry a `revision`, incremented on every change. `revise_entity`
+accepts an `expected_revision` and refuses a write built on a stale read, so two
+devices editing one open loop produce a detected conflict instead of a silent
+last-write-wins.
 
 ## 7. Nothing is deleted
 
@@ -180,12 +209,24 @@ certainty is a probability.
 
 Sensitivity is part of the model from the start, not a later feature.
 
-Sensitivity is per record, which leaves a trap: an attribute sharper than its
-type's default would force a choice between over-classifying the whole record
-and dropping the field. `EntityAttributes.minimum_sensitivity()` closes it by
-raising the record's floor. A `PLACE` is `S2` and carries a city and an area;
-one carrying a `street_address` must be `S3` or it cannot be constructed. The
-area still reaches Radar; the address never can.
+Sensitivity is classified at two levels, because a record is not uniform. A
+place holds a city, an area, a street address and coordinates; only the last two
+locate a woman precisely.
+
+`EntityAttributes.SENSITIVE_FIELDS` names the fields sharper than their type's
+default. From it:
+
+- `sensitivity_floor()` is the highest level among *populated* sensitive fields.
+  A record declared below its floor cannot be constructed, so an address can
+  never sit on an `S1` place.
+- `redacted_to(ceiling)` drops the fields above a ceiling and reports which
+  names were dropped, never their values.
+
+Projection tries the whole record first and falls back to a redacted one, so a
+mind cleared to `S2` receives the city and area of the same record with the
+address and coordinates withheld, and `redacted_fields` tells it something was
+held back. Losing the city along with the street would be breakage dressed as
+minimization. See ADR-007.
 
 ## 11. Memory
 

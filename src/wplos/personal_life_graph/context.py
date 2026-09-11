@@ -41,6 +41,7 @@ class ContextScope(BaseModel):
 
 class RedactionScope(StrEnum):
     ENTITY = "ENTITY"
+    ENTITY_FIELD = "ENTITY_FIELD"
     RELATIONSHIP = "RELATIONSHIP"
     MEMORY = "MEMORY"
 
@@ -114,13 +115,21 @@ def project_context(
     candidates = graph.entities(
         owner_id=owner_id, entity_types=scope.required_entity_types or None, at=at
     )
-    entities = tuple(
-        entity
-        for entity in candidates
-        if admit(RedactionScope.ENTITY, entity.sensitivity, scope.requires(entity.entity_type))
-    )
+    entities: list[Entity] = []
+    for candidate in candidates:
+        required = scope.requires(candidate.entity_type)
+        if admit(RedactionScope.ENTITY, candidate.sensitivity, required):
+            entities.append(candidate)
+            continue
+        # The record as a whole is too sensitive; some of its fields may not be.
+        trimmed = candidate.redacted_to(scope.max_sensitivity)
+        if trimmed is None:
+            continue
+        if admit(RedactionScope.ENTITY_FIELD, trimmed.sensitivity, required):
+            entities.append(trimmed)
 
     admitted = {entity.id: entity for entity in entities}
+    entities_out = tuple(entities)
     relationships = tuple(
         relationship
         for relationship in graph.relationships(owner_id=owner_id, at=at)
@@ -151,7 +160,7 @@ def project_context(
         scope=scope,
         owner_id=owner_id,
         as_of=at,
-        entities=entities,
+        entities=entities_out,
         relationships=relationships,
         memories=memories,
         redactions=tuple(

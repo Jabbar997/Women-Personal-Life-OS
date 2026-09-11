@@ -1,8 +1,18 @@
 from datetime import datetime
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from wplos.core.identifiers import ActionId, AuthorizationId, EntityId, MemoryId
+from wplos.core.identifiers import (
+    ActionId,
+    AttemptId,
+    AuthorizationId,
+    EntityId,
+    IdempotencyKeyLike,
+    MemoryId,
+    NotificationId,
+)
+from wplos.core.provenance import SourceType
 from wplos.core.roles import AgentName
 from wplos.core.temporal import ensure_utc
 from wplos.events.types import EventType
@@ -12,10 +22,13 @@ from wplos.personal_life_graph.attributes import (
     CyclePhase,
     OpenLoopState,
     RadarCategory,
+    RequirementKind,
+    RequirementStatus,
 )
 from wplos.personal_life_graph.entity_types import EntityType
 from wplos.personal_life_graph.memory import MemoryType
 from wplos.policy.guardian import GuardianCheck, GuardianVerdict
+from wplos.policy.notification import NotificationUrgency
 from wplos.policy.permissions import ActionDomain, PermissionLevel
 from wplos.shared.errors import UnknownEventType
 
@@ -85,9 +98,49 @@ class CalendarConflictPayload(EventPayload):
     overlap_minutes: int = Field(ge=1)
 
 
+class CaptureKind(StrEnum):
+    """Universal capture is not a text box.
+
+    The domain names the shape of an input without ever holding its bytes.
+    """
+
+    TEXT = "TEXT"
+    VOICE = "VOICE"
+    PHOTO = "PHOTO"
+    SCREENSHOT = "SCREENSHOT"
+    DOCUMENT_FILE = "DOCUMENT_FILE"
+    SHARED_LINK = "SHARED_LINK"
+    SHARE_SHEET = "SHARE_SHEET"
+
+
+class MediaRef(BaseModel):
+    """A pointer to media held outside the domain, never the media itself."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    media_id: str
+    media_type: str
+    byte_size: int | None = Field(default=None, ge=0)
+    checksum: str | None = None
+    storage_ref: str | None = None
+    duration_seconds: float | None = Field(default=None, ge=0.0)
+
+
+class CaptureState(StrEnum):
+    RECEIVED = "RECEIVED"
+    QUEUED = "QUEUED"
+    PARSING = "PARSING"
+    PARSED = "PARSED"
+    FAILED = "FAILED"
+    INVALIDATED = "INVALIDATED"
+
+
 class CapturePayload(EventPayload):
     capture_id: str
-    channel: str
+    kind: CaptureKind
+    state: CaptureState = CaptureState.RECEIVED
+    media: tuple[MediaRef, ...] = Field(default_factory=tuple)
+    text_excerpt: str | None = None
 
 
 class CaptureParsedPayload(EventPayload):
@@ -100,9 +153,61 @@ class CaptureRoutedPayload(EventPayload):
     routed_to: tuple[AgentName, ...]
 
 
+class CaptureInvalidatedPayload(EventPayload):
+    """The user withdrew a source. Derived facts must be reconsidered, and the
+    audit trail must survive."""
+
+    capture_id: str
+    reason: str
+    derived_entity_ids: tuple[EntityId, ...] = Field(default_factory=tuple)
+
+
+class CaptureCorrectedPayload(EventPayload):
+    capture_id: str
+    field_corrected: str
+    corrected_entity_id: EntityId | None = None
+
+
+class SourceConflictPayload(EventPayload):
+    """Two sources disagree and the weaker one was refused."""
+
+    subject: str
+    entity_id: EntityId | None = None
+    incoming_source: SourceType
+    retained_source: SourceType
+    resolution: str
+
+
+class RequirementPayload(EventPayload):
+    requirement_entity_id: EntityId
+    event_entity_id: EntityId | None = None
+    kind: RequirementKind
+    status: RequirementStatus
+
+
+class RequirementStatusChangedPayload(RequirementPayload):
+    previous_status: RequirementStatus
+    cause_entity_id: EntityId | None = None
+
+
+class NotificationPayload(EventPayload):
+    notification_id: NotificationId
+    urgency: NotificationUrgency
+    content_withheld: bool = False
+
+
+class DeliveryPayload(EventPayload):
+    notification_id: NotificationId
+    detail: str | None = None
+
+
 class MemoryPayload(EventPayload):
     memory_id: MemoryId
     memory_type: MemoryType
+
+
+class MemoryClosurePayload(MemoryPayload):
+    reason: str
 
 
 class MemoryInvalidatedPayload(MemoryPayload):
@@ -229,6 +334,25 @@ class OperatorAuthorizationPayload(EventPayload):
 
 class OperatorActionResultPayload(EventPayload):
     action_id: ActionId
+    attempt_id: AttemptId | None = None
+    detail: str | None = None
+
+
+class OperatorPartialOutcomePayload(EventPayload):
+    """Neither "it worked" nor "it failed"; say which parts did."""
+
+    action_id: ActionId
+    attempt_id: AttemptId
+    succeeded_steps: tuple[str, ...]
+    failed_steps: tuple[str, ...]
+
+
+class OperatorOutcomeUnknownPayload(EventPayload):
+    """The external service did not answer. A retry is not automatically safe."""
+
+    action_id: ActionId
+    attempt_id: AttemptId
+    idempotency_key: IdempotencyKeyLike
     detail: str | None = None
 
 
@@ -255,6 +379,24 @@ PAYLOAD_BY_EVENT: dict[EventType, type[EventPayload]] = {
     EventType.MEMORY_CREATED: MemoryPayload,
     EventType.MEMORY_UPDATED: MemoryPayload,
     EventType.MEMORY_INVALIDATED: MemoryInvalidatedPayload,
+    EventType.MEMORY_SUPERSEDED: MemoryClosurePayload,
+    EventType.MEMORY_SUPPRESSED: MemoryClosurePayload,
+    EventType.CAPTURE_INVALIDATED: CaptureInvalidatedPayload,
+    EventType.CAPTURE_CORRECTED: CaptureCorrectedPayload,
+    EventType.SOURCE_CONFLICT_DETECTED: SourceConflictPayload,
+    EventType.REQUIREMENT_CREATED: RequirementPayload,
+    EventType.REQUIREMENT_STATUS_CHANGED: RequirementStatusChangedPayload,
+    EventType.NOTIFICATION_RAISED: NotificationPayload,
+    EventType.NOTIFICATION_SUPPRESSED: NotificationPayload,
+    EventType.NOTIFICATION_DISPATCHED: DeliveryPayload,
+    EventType.NOTIFICATION_DELIVERED: DeliveryPayload,
+    EventType.NOTIFICATION_FAILED: DeliveryPayload,
+    EventType.NOTIFICATION_OPENED: DeliveryPayload,
+    EventType.OPERATOR_ACTION_PARTIALLY_SUCCEEDED: OperatorPartialOutcomePayload,
+    EventType.OPERATOR_ACTION_OUTCOME_UNKNOWN: OperatorOutcomeUnknownPayload,
+    EventType.OPERATOR_ACTION_REVOKED: OperatorActionResultPayload,
+    EventType.OPERATOR_ACTION_EXPIRED: OperatorActionResultPayload,
+    EventType.OPERATOR_ACTION_COMPENSATED: OperatorActionResultPayload,
     EventType.RECOMMENDATION_SURFACED: RecommendationPayload,
     EventType.RECOMMENDATION_ACCEPTED: RecommendationPayload,
     EventType.RECOMMENDATION_DISMISSED: RecommendationPayload,

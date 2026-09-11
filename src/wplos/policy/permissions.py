@@ -85,3 +85,24 @@ MINIMUM_PERMISSION: dict[ActionDomain, PermissionLevel] = {
 
 def minimum_permission_for(domain: ActionDomain) -> PermissionLevel:
     return MINIMUM_PERMISSION[domain]
+
+
+class ReversibilityClass(StrEnum):
+    """Whether an action can actually be taken back.
+
+    Offering "undo" on a sent message is a lie the interface must not be able to
+    tell, so the distinction lives in the domain rather than in a button.
+    """
+
+    REVERSIBLE = "REVERSIBLE"
+    COMPENSATABLE = "COMPENSATABLE"
+    IRREVERSIBLE = "IRREVERSIBLE"
+
+    @property
+    def offers_undo(self) -> bool:
+        return self is ReversibilityClass.REVERSIBLE
+
+    @property
+    def offers_compensation(self) -> bool:
+        """A booking cannot be un-made, but it can be cancelled."""
+        return self is ReversibilityClass.COMPENSATABLE

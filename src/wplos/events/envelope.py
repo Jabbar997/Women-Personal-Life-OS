@@ -3,6 +3,7 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, field_validator, model_validator
 
+from wplos.core.client import ClientRef, EventOrigin
 from wplos.core.identifiers import (
     CorrelationId,
     EntityId,
@@ -80,6 +81,8 @@ class DomainEvent(BaseModel):
     subject: Subject
     correlation_id: CorrelationId
     causation_id: EventId | None = None
+    origin: EventOrigin = EventOrigin.SERVER
+    client: ClientRef | None = None
     source: SourceRef
     sensitivity: SensitivityLevel
     payload: SerializeAsAny[EventPayload]
@@ -101,6 +104,23 @@ class DomainEvent(BaseModel):
             return data
         model = payload_model_for(EventType(event_type))
         return {**data, "payload": model.model_validate(raw)}
+
+    @model_validator(mode="after")
+    def _cannot_cause_itself(self) -> Self:
+        if self.causation_id == self.event_id:
+            raise ValueError("an event cannot be its own cause")
+        return self
+
+    @model_validator(mode="after")
+    def _client_events_are_identifiable(self) -> Self:
+        """A submission from a phone must be recognisable if it arrives twice.
+
+        Mobile networks retry. Without a client event id there is no way to tell
+        a retry from a second commitment.
+        """
+        if self.origin.is_remote_client and self.client is None:
+            raise ValueError("an event from a device must carry a ClientRef")
+        return self
 
     @model_validator(mode="after")
     def _payload_matches_type(self) -> Self:
@@ -125,6 +145,8 @@ class DomainEvent(BaseModel):
         recorded_at: datetime | None = None,
         correlation_id: CorrelationId | None = None,
         causation_id: EventId | None = None,
+        origin: EventOrigin = EventOrigin.SERVER,
+        client: ClientRef | None = None,
         metadata: dict[str, JsonValue] | None = None,
     ) -> "DomainEvent":
         return cls(
@@ -136,6 +158,8 @@ class DomainEvent(BaseModel):
             subject=subject,
             correlation_id=correlation_id or new_correlation_id(),
             causation_id=causation_id,
+            origin=origin,
+            client=client,
             source=source,
             sensitivity=sensitivity,
             payload=payload,
@@ -152,6 +176,7 @@ class DomainEvent(BaseModel):
         sensitivity: SensitivityLevel,
         occurred_at: datetime,
         subject: Subject | None = None,
+        origin: EventOrigin = EventOrigin.SERVER,
         metadata: dict[str, JsonValue] | None = None,
     ) -> "DomainEvent":
         """Derive a consequence of this event, carrying the correlation forward."""
@@ -165,8 +190,18 @@ class DomainEvent(BaseModel):
             occurred_at=occurred_at,
             correlation_id=self.correlation_id,
             causation_id=self.event_id,
+            origin=origin,
             metadata=metadata,
         )
+
+    @property
+    def client_event_id(self) -> str | None:
+        return None if self.client is None else str(self.client.client_event_id)
+
+    @property
+    def arrived_late(self) -> bool:
+        """Recorded well after it happened, as an offline device's events are."""
+        return self.recorded_at > self.occurred_at
 
     def to_json(self) -> str:
         return self.model_dump_json()

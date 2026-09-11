@@ -10,6 +10,10 @@ CorrelationId = NewType("CorrelationId", str)
 RequestId = NewType("RequestId", str)
 ActionId = NewType("ActionId", str)
 AuthorizationId = NewType("AuthorizationId", str)
+AssessmentId = NewType("AssessmentId", str)
+AttemptId = NewType("AttemptId", str)
+NotificationId = NewType("NotificationId", str)
+IdempotencyKeyLike = NewType("IdempotencyKeyLike", str)
 
 
 def _mint(prefix: str) -> str:
@@ -50,3 +54,15 @@ def new_action_id() -> ActionId:
 
 def new_authorization_id() -> AuthorizationId:
     return AuthorizationId(_mint("aut"))
+
+
+def new_assessment_id() -> AssessmentId:
+    return AssessmentId(_mint("asm"))
+
+
+def new_attempt_id() -> AttemptId:
+    return AttemptId(_mint("att"))
+
+
+def new_notification_id() -> NotificationId:
+    return NotificationId(_mint("ntf"))

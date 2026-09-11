@@ -80,6 +80,21 @@ class MemoryRecord(ProvenancedRecord):
             }
         )
 
+    def suppressed(self, *, at: datetime, reason: str) -> "MemoryRecord":
+        """Stop surfacing it without claiming it is untrue or erasing it.
+
+        "Don't bring this up" is a display decision. It is not invalidation and
+        it is not an erasure request.
+        """
+        return self.model_copy(
+            update={
+                "status": RecordStatus.SUPPRESSED,
+                "updated_at": at,
+                "revision": self.revision + 1,
+                "metadata": {**self.metadata, "suppression_reason": reason},
+            }
+        )
+
     def superseded(self, *, at: datetime, reason: str) -> "MemoryRecord":
         """The memory was true and has stopped being true.
 
@@ -98,6 +113,7 @@ class MemoryRecord(ProvenancedRecord):
                 "temporal": self.temporal.closed_at(at),
                 "status": status,
                 "updated_at": at,
+                "revision": self.revision + 1,
                 "metadata": {**self.metadata, "closure_reason": reason},
             }
         )

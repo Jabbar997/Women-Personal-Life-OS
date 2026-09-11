@@ -17,7 +17,13 @@ from wplos.policy.decisions import (
     reason,
 )
 from wplos.policy.guardian import GuardianAssessment, GuardianVerdict
-from wplos.policy.permissions import ActionDomain, PermissionLevel, minimum_permission_for
+from wplos.policy.guardian_authority import GuardianAuthority
+from wplos.policy.permissions import (
+    ActionDomain,
+    PermissionLevel,
+    ReversibilityClass,
+    minimum_permission_for,
+)
 from wplos.shared.errors import AuthorizationRequired
 from wplos.shared.json import JsonValue
 
@@ -48,8 +54,9 @@ class ProposedAction(BaseModel):
     domain: ActionDomain
     permission_level: PermissionLevel
     summary: str
-    reversible: bool
+    reversibility: ReversibilityClass
     target_entity_id: EntityId | None = None
+    offer_expires_at: datetime | None = None
     material_terms: dict[str, JsonValue] = Field(default_factory=dict)
     parameters: dict[str, JsonValue] = Field(default_factory=dict)
 
@@ -83,6 +90,15 @@ class ProposedAction(BaseModel):
     @classmethod
     def _utc(cls, value: datetime) -> datetime:
         return ensure_utc(value)
+
+    @field_validator("offer_expires_at")
+    @classmethod
+    def _optional_utc(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else ensure_utc(value)
+
+    def offer_expired_at(self, at: datetime) -> bool:
+        """An offer shown on a screen two hours ago is not an offer now."""
+        return self.offer_expires_at is not None and ensure_utc(at) >= self.offer_expires_at
 
     @model_validator(mode="after")
     def _permission_matches_domain(self) -> Self:
@@ -121,8 +137,10 @@ class ExecutionAuthorization(BaseModel):
     guardian_verdict: GuardianVerdict
     expires_at: datetime | None = None
     audit_ref: str | None = None
+    revoked_at: datetime | None = None
+    revocation_reason: str | None = None
 
-    @field_validator("granted_at", "expires_at")
+    @field_validator("granted_at", "expires_at", "revoked_at")
     @classmethod
     def _utc(cls, value: datetime | None) -> datetime | None:
         return None if value is None else ensure_utc(value)
@@ -157,6 +175,14 @@ class ExecutionAuthorization(BaseModel):
     def is_expired_at(self, at: datetime) -> bool:
         return self.expires_at is not None and ensure_utc(at) >= self.expires_at
 
+    def revoked(self, *, at: datetime, reason: str) -> "ExecutionAuthorization":
+        """She changed her mind. Consent is withdrawn from this instant on."""
+        return self.model_copy(update={"revoked_at": ensure_utc(at), "revocation_reason": reason})
+
+    @property
+    def is_revoked(self) -> bool:
+        return self.revoked_at is not None
+
     def covers(self, action: ProposedAction) -> bool:
         return (
             self.action_id == action.action_id
@@ -168,10 +194,15 @@ class ExecutionPolicy:
     """The single gate between intent and the real world.
 
     Guardian's veto is checked before anything else, so no permission level and
-    no authorization can buy past a BLOCK.
+    no authorization can buy past a BLOCK. The ``action`` passed here must be
+    the server's freshly derived proposal, never a copy posted back by a client:
+    a stale screen is an input, not a source of truth.
     """
 
     name = POLICY_NAME
+
+    def __init__(self, authority: GuardianAuthority | None = None) -> None:
+        self.authority = authority
 
     def authorize(
         self,
@@ -180,9 +211,15 @@ class ExecutionPolicy:
         authorization: ExecutionAuthorization | None,
         at: datetime,
     ) -> PolicyDecision:
-        veto = self._check_guardian(guardian, action)
+        veto = self._check_guardian(guardian, action, at)
         if veto is not None:
             return veto
+
+        if action.offer_expired_at(at):
+            return PolicyDecision.require_confirmation(
+                POLICY_NAME,
+                reason(ReasonCode.OFFER_EXPIRED, "the offer this action came from has expired"),
+            )
 
         level = action.permission_level
         if not level.is_executable:
@@ -199,7 +236,7 @@ class ExecutionPolicy:
         return self._check_authorization(action, authorization, at, guardian)
 
     def _check_guardian(
-        self, guardian: GuardianAssessment, action: ProposedAction
+        self, guardian: GuardianAssessment, action: ProposedAction, at: datetime
     ) -> PolicyDecision | None:
         if guardian.subject_action_id != action.action_id:
             return PolicyDecision.deny(
@@ -209,6 +246,42 @@ class ExecutionPolicy:
                     "no Guardian assessment of this action was supplied",
                 ),
             )
+        if (
+            guardian.subject_fingerprint is not None
+            and guardian.subject_fingerprint != action.terms_fingerprint
+        ):
+            return PolicyDecision.deny(
+                POLICY_NAME,
+                reason(
+                    ReasonCode.GUARDIAN_ASSESSMENT_STALE,
+                    "Guardian assessed different terms from the ones being executed",
+                ),
+            )
+        if self.authority is not None:
+            if not self.authority.is_authentic(guardian):
+                return PolicyDecision.deny(
+                    POLICY_NAME,
+                    reason(
+                        ReasonCode.GUARDIAN_ASSESSMENT_FORGED,
+                        "this verdict was not issued by Guardian",
+                    ),
+                )
+            if self.authority.is_superseded(guardian):
+                return PolicyDecision.deny(
+                    POLICY_NAME,
+                    reason(
+                        ReasonCode.GUARDIAN_ASSESSMENT_SUPERSEDED,
+                        "Guardian has since reassessed this action",
+                    ),
+                )
+            if self.authority.is_stale_at(guardian, at):
+                return PolicyDecision.require_confirmation(
+                    POLICY_NAME,
+                    reason(
+                        ReasonCode.GUARDIAN_ASSESSMENT_STALE,
+                        "the Guardian assessment is too old to execute against",
+                    ),
+                )
         if guardian.verdict is GuardianVerdict.BLOCK:
             return PolicyDecision.deny(
                 POLICY_NAME,
@@ -276,6 +349,14 @@ class ExecutionPolicy:
                     ReasonCode.AUTHORIZATION_MISMATCH, "authorization was granted by another user"
                 ),
             )
+        if authorization.is_revoked:
+            return PolicyDecision.deny(
+                POLICY_NAME,
+                reason(
+                    ReasonCode.AUTHORIZATION_REVOKED,
+                    authorization.revocation_reason or "the user withdrew this authorization",
+                ),
+            )
         if authorization.is_expired_at(at):
             return PolicyDecision.require_confirmation(
                 POLICY_NAME,
@@ -315,7 +396,11 @@ class ExecutionPolicy:
         )
 
 
-DEFAULT_EXECUTION_POLICY = ExecutionPolicy()
+DEFAULT_GUARDIAN_AUTHORITY = GuardianAuthority()
+"""The process-level Guardian capability. It belongs to the Orchestrator; a mind
+that holds it can mint verdicts the gate believes."""
+
+DEFAULT_EXECUTION_POLICY = ExecutionPolicy(DEFAULT_GUARDIAN_AUTHORITY)
 
 
 def require_execution_authorization(

@@ -147,6 +147,20 @@ class ConfidenceRule:
         return left if left.confidence.score > right.confidence.score else right
 
 
+class UnresolvedContention(BaseModel):
+    """Two claims wanted the same thing and no rule could separate them.
+
+    Keeping both and saying nothing would be indistinguishable from claims that
+    never conflicted, which is how a device marking a loop completed and another
+    marking it cancelled quietly becomes whichever arrived last.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    subject: str
+    claim_ids: tuple[str, ...]
+
+
 class SuppressedClaim(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -160,6 +174,12 @@ class ConflictResolution(BaseModel):
 
     surviving: tuple[Claim, ...] = Field(default_factory=tuple)
     suppressed: tuple[SuppressedClaim, ...] = Field(default_factory=tuple)
+    unresolved: tuple[UnresolvedContention, ...] = Field(default_factory=tuple)
+
+    @property
+    def needs_the_user(self) -> bool:
+        """An unresolved contention is a question, not a result."""
+        return bool(self.unresolved)
 
     def winner_for(self, subject: str) -> Claim | None:
         return next((claim for claim in self.surviving if claim.subject == subject), None)
@@ -207,23 +227,41 @@ class ConflictResolutionPolicy:
     def resolve(self, claims: tuple[Claim, ...]) -> ConflictResolution:
         surviving: list[Claim] = []
         suppressed: list[SuppressedClaim] = []
+        unresolved: list[UnresolvedContention] = []
         by_subject: dict[str, list[Claim]] = {}
         for claim in claims:
             by_subject.setdefault(claim.subject, []).append(claim)
 
-        for subject_claims in by_subject.values():
+        for subject, subject_claims in by_subject.items():
             leader = subject_claims[0]
+            deadlocked: list[str] = []
             for challenger in subject_claims[1:]:
                 outcome = self.arbitrate(leader, challenger)
                 if outcome is None:
                     surviving.append(challenger)
+                    if self._deadlocked(leader, challenger):
+                        deadlocked.extend((leader.claim_id, challenger.claim_id))
                     continue
                 winner, loser, rule = outcome
                 suppressed.append(SuppressedClaim(claim=loser, lost_to=winner.claim_id, rule=rule))
                 leader = winner
             surviving.append(leader)
+            if deadlocked:
+                unresolved.append(
+                    UnresolvedContention(
+                        subject=subject, claim_ids=tuple(dict.fromkeys(deadlocked))
+                    )
+                )
 
-        return ConflictResolution(surviving=tuple(surviving), suppressed=tuple(suppressed))
+        return ConflictResolution(
+            surviving=tuple(surviving),
+            suppressed=tuple(suppressed),
+            unresolved=tuple(unresolved),
+        )
+
+    def _deadlocked(self, left: Claim, right: Claim) -> bool:
+        """Both wanted the subject to themselves and no rule could choose."""
+        return left.nature.is_exclusive and right.nature.is_exclusive
 
 
 DEFAULT_CONFLICT_POLICY = ConflictResolutionPolicy()

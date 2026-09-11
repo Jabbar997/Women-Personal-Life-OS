@@ -1,8 +1,11 @@
+from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from wplos.core.identifiers import ActionId
+from wplos.core.identifiers import ActionId, AssessmentId, new_assessment_id
+from wplos.core.roles import AgentName
+from wplos.core.temporal import ensure_utc, utc_now
 
 
 class GuardianVerdict(StrEnum):
@@ -42,18 +45,39 @@ class GuardianFinding(BaseModel):
 
 
 class GuardianAssessment(BaseModel):
-    """Guardian's answer about one subject, usually a proposed action."""
+    """Guardian's answer about one subject, usually a proposed action.
+
+    It names what it assessed, the exact terms it assessed, and when. A verdict
+    floating free of its subject is how a BLOCK gets bypassed; a verdict with no
+    timestamp is how a stale ALLOW outlives the risk it cleared.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    assessment_id: AssessmentId = Field(default_factory=new_assessment_id)
     subject_action_id: ActionId | None = None
+    subject_fingerprint: str | None = None
     verdict: GuardianVerdict
     findings: tuple[GuardianFinding, ...] = Field(default_factory=tuple)
+    issued_by: AgentName = AgentName.GUARDIAN
+    assessed_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("assessed_at")
+    @classmethod
+    def _utc(cls, value: datetime) -> datetime:
+        return ensure_utc(value)
+
+    @field_validator("issued_by")
+    @classmethod
+    def _only_guardian(cls, value: AgentName) -> AgentName:
+        if value is not AgentName.GUARDIAN:
+            raise ValueError("only Guardian issues a Guardian assessment")
+        return value
 
     @classmethod
     def allow(cls, subject_action_id: ActionId) -> "GuardianAssessment":
-        """An assessment always names what it assessed; a verdict floating free
-        of its subject is how a BLOCK gets bypassed."""
+        """Unverifiable by design: use ``GuardianAuthority.allow`` for anything
+        the execution gate will see."""
         return cls(subject_action_id=subject_action_id, verdict=GuardianVerdict.ALLOW)
 
     @classmethod
@@ -61,6 +85,7 @@ class GuardianAssessment(BaseModel):
         cls,
         findings: tuple[GuardianFinding, ...],
         subject_action_id: ActionId | None = None,
+        subject_fingerprint: str | None = None,
     ) -> "GuardianAssessment":
         """The strictest finding decides; Guardian never averages its own warnings."""
         verdict = max(
@@ -68,7 +93,12 @@ class GuardianAssessment(BaseModel):
             key=lambda value: _SEVERITY[value],
             default=GuardianVerdict.ALLOW,
         )
-        return cls(subject_action_id=subject_action_id, verdict=verdict, findings=findings)
+        return cls(
+            subject_action_id=subject_action_id,
+            subject_fingerprint=subject_fingerprint,
+            verdict=verdict,
+            findings=findings,
+        )
 
     @property
     def is_veto(self) -> bool:

@@ -86,9 +86,21 @@ RELATIONSHIP_SPECS: dict[RelationshipType, RelationshipSpec] = {
         RelationshipSpec(
             relationship_type=RelationshipType.REQUIRES,
             from_types=frozenset(
-                {EntityType.CALENDAR_EVENT, EntityType.TASK, EntityType.COMMITMENT}
+                {
+                    EntityType.CALENDAR_EVENT,
+                    EntityType.TASK,
+                    EntityType.COMMITMENT,
+                    EntityType.REQUIREMENT,
+                }
             ),
-            to_types=frozenset({EntityType.WARDROBE_ITEM, EntityType.PRODUCT, EntityType.DOCUMENT}),
+            to_types=frozenset(
+                {
+                    EntityType.WARDROBE_ITEM,
+                    EntityType.PRODUCT,
+                    EntityType.DOCUMENT,
+                    EntityType.REQUIREMENT,
+                }
+            ),
         ),
         RelationshipSpec(
             relationship_type=RelationshipType.SUPPORTED_BY,

@@ -13,6 +13,7 @@ from wplos.events.bus import InMemoryEventBus
 from wplos.events.envelope import CURRENT_SCHEMA_VERSION, Actor, DomainEvent, Subject
 from wplos.events.payloads import (
     PAYLOAD_BY_EVENT,
+    CaptureKind,
     CapturePayload,
     DeadlinePayload,
     OpenLoopPayload,
@@ -27,7 +28,7 @@ from wplos.shared.errors import InvariantViolation
 def _capture(owner: UserId, at: datetime) -> DomainEvent:
     return DomainEvent.emit(
         event_type=EventType.CAPTURE_RECEIVED,
-        payload=CapturePayload(capture_id="cap_1", channel="chat"),
+        payload=CapturePayload(capture_id="cap_1", kind=CaptureKind.TEXT),
         actor=Actor.user(owner),
         subject=Subject(owner_id=owner),
         source=SourceRef.user_declared(at),
@@ -79,7 +80,7 @@ def test_payload_must_match_the_event_type(owner: UserId, now: datetime) -> None
     with pytest.raises(ValidationError, match="requires"):
         DomainEvent.emit(
             event_type=EventType.TASK_CREATED,
-            payload=CapturePayload(capture_id="cap_1", channel="chat"),
+            payload=CapturePayload(capture_id="cap_1", kind=CaptureKind.TEXT),
             actor=Actor.user(owner),
             subject=Subject(owner_id=owner),
             source=SourceRef.user_declared(now),

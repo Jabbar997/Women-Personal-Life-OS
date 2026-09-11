@@ -6,9 +6,10 @@ from pydantic import Field, SerializeAsAny, model_validator
 from wplos.core.attribution import Attribution
 from wplos.core.identifiers import EntityId, UserId, new_entity_id
 from wplos.core.records import ProvenancedRecord, RecordStatus
+from wplos.core.sensitivity import SensitivityLevel
 from wplos.core.temporal import TemporalMarkers, TemporalValidity
 from wplos.personal_life_graph.attributes import EntityAttributes, attributes_model_for
-from wplos.personal_life_graph.entity_types import EntityType
+from wplos.personal_life_graph.entity_types import EntityType, default_sensitivity
 from wplos.shared.errors import InvariantViolation
 from wplos.shared.json import JsonValue
 
@@ -27,6 +28,7 @@ class Entity(ProvenancedRecord):
     label: str
     attributes: SerializeAsAny[EntityAttributes]
     markers: TemporalMarkers = Field(default_factory=TemporalMarkers.none)
+    redacted_fields: frozenset[str] = Field(default_factory=frozenset)
 
     @model_validator(mode="before")
     @classmethod
@@ -54,7 +56,7 @@ class Entity(ProvenancedRecord):
 
     @model_validator(mode="after")
     def _sensitivity_covers_its_content(self) -> Self:
-        floor = self.attributes.minimum_sensitivity()
+        floor = self.attributes.sensitivity_floor()
         if floor is not None and not self.attribution.sensitivity.dominates(floor):
             raise ValueError(
                 f"{self.entity_type} carrying this content requires at least {floor}, "
@@ -109,12 +111,45 @@ class Entity(ProvenancedRecord):
                 "markers": markers or self.markers,
                 "attribution": attribution or self.attribution,
                 "updated_at": at,
+                "revision": self.revision + 1,
             }
         )
 
     def closed(self, *, at: datetime, status: RecordStatus) -> "Entity":
         return self.model_copy(
-            update={"temporal": self.temporal.closed_at(at), "status": status, "updated_at": at}
+            update={
+                "temporal": self.temporal.closed_at(at),
+                "status": status,
+                "updated_at": at,
+                "revision": self.revision + 1,
+            }
+        )
+
+    def redacted_to(self, ceiling: SensitivityLevel) -> "Entity | None":
+        """This record as a mind cleared to ``ceiling`` may see it.
+
+        Fields above the ceiling are dropped and the record's sensitivity falls
+        to what actually remains, so a city survives while a street address does
+        not. ``None`` means nothing readable is left.
+        """
+        if ceiling.dominates(self.sensitivity):
+            return self
+        attributes, dropped = self.attributes.redacted_to(ceiling)
+        if not dropped:
+            return None
+        remaining = attributes.sensitivity_floor()
+        reduced = max(
+            (default_sensitivity(self.entity_type), remaining or SensitivityLevel.S0),
+            key=lambda level: level.rank,
+        )
+        if not ceiling.dominates(reduced):
+            return None
+        return self.model_copy(
+            update={
+                "attributes": attributes,
+                "attribution": self.attribution.model_copy(update={"sensitivity": reduced}),
+                "redacted_fields": self.redacted_fields | dropped,
+            }
         )
 
     def attributes_as[T: EntityAttributes](self, model: type[T]) -> T:

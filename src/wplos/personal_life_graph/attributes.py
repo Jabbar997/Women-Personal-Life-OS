@@ -1,11 +1,15 @@
+from collections.abc import Mapping
 from datetime import date, datetime
 from enum import StrEnum
+from typing import ClassVar, Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from wplos.core.identifiers import EntityId
+from wplos.core.money import Money
 from wplos.core.sensitivity import SensitivityLevel
-from wplos.core.temporal import ensure_utc
+from wplos.core.temporal import ZonedInstant, ensure_utc
 from wplos.personal_life_graph.entity_types import EntityType, LifeDomain
 from wplos.shared.errors import InvariantViolation
 
@@ -20,15 +24,38 @@ class EntityAttributes(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    def minimum_sensitivity(self) -> SensitivityLevel | None:
-        """The floor this content imposes on its record, if any.
+    SENSITIVE_FIELDS: ClassVar[Mapping[str, SensitivityLevel]] = {}
+    """Fields sharper than their type's default, and how sharp.
 
-        Record-level sensitivity alone forces a choice between over-classifying
-        a whole record and dropping the one field that is genuinely sensitive.
-        An attributes model that can hold something sharper than its type's
-        default raises the floor instead.
+    Record-level sensitivity alone forces a choice between over-classifying a
+    whole record and dropping the one field that is genuinely sensitive. An
+    address makes a place S3; the city in the same record is not S3, and a mind
+    that only needs the city should still get it.
+    """
+
+    def sensitivity_floor(self) -> SensitivityLevel | None:
+        """The floor the *populated* sensitive fields impose on this record."""
+        levels = [
+            level
+            for field, level in self.SENSITIVE_FIELDS.items()
+            if getattr(self, field, None) is not None
+        ]
+        return max(levels, key=lambda level: level.rank) if levels else None
+
+    def redacted_to(self, ceiling: SensitivityLevel) -> tuple[Self, frozenset[str]]:
+        """Drop the fields above ``ceiling``, keeping the rest of the record.
+
+        Returns the surviving attributes and the names withheld — never their
+        values.
         """
-        return None
+        dropped = frozenset(
+            field
+            for field, level in self.SENSITIVE_FIELDS.items()
+            if getattr(self, field, None) is not None and not ceiling.dominates(level)
+        )
+        if not dropped:
+            return self, frozenset()
+        return self.model_copy(update=dict.fromkeys(dropped)), dropped
 
 
 class Kinship(StrEnum):
@@ -133,8 +160,14 @@ class DeadlineAttributes(EntityAttributes):
 
 class CalendarEventAttributes(EntityAttributes):
     """Start time lives in the entity's ``scheduled_for`` marker; only the end
-    of the interval is an attribute."""
+    of the interval is an attribute.
 
+    ``time_zone`` is what the event is anchored to. An appointment at 09:00 in
+    Riyadh stays at 09:00 in Riyadh when she lands in London, so the zone has to
+    travel with the event rather than be read from wherever she happens to be.
+    """
+
+    time_zone: str | None = None
     ends_at: datetime | None = None
     all_day: bool = False
     place_entity_id: EntityId | None = None
@@ -145,6 +178,23 @@ class CalendarEventAttributes(EntityAttributes):
     @classmethod
     def _utc(cls, value: datetime | None) -> datetime | None:
         return None if value is None else ensure_utc(value)
+
+    @field_validator("time_zone")
+    @classmethod
+    def _known_zone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ValueError(f"unknown IANA time zone: {value}") from error
+        return value
+
+    def anchored(self, instant: datetime | None) -> ZonedInstant:
+        """The start as the event's own zone reads it."""
+        if instant is None:
+            raise InvariantViolation("this event has no scheduled start")
+        return ZonedInstant(instant=instant, time_zone=self.time_zone or "UTC")
 
 
 class RecurrenceUnit(StrEnum):
@@ -292,8 +342,7 @@ class PurchaseAttributes(EntityAttributes):
     """A purchase captured in conversation often has no price attached yet;
     ``None`` says unknown rather than free."""
 
-    currency: str = Field(min_length=3, max_length=3)
-    amount_minor: int | None = Field(default=None, ge=0)
+    amount: Money | None = None
     merchant: str | None = None
     returnable_until: datetime | None = None
 
@@ -304,8 +353,7 @@ class PurchaseAttributes(EntityAttributes):
 
 
 class SubscriptionAttributes(EntityAttributes):
-    amount_minor: int = Field(ge=0)
-    currency: str = Field(min_length=3, max_length=3)
+    amount: Money
     renews_at: datetime | None = None
     cancellable_until: datetime | None = None
     auto_renew: bool = True
@@ -317,9 +365,9 @@ class SubscriptionAttributes(EntityAttributes):
 
 
 class MoneyContextAttributes(EntityAttributes):
-    currency: str = Field(min_length=3, max_length=3)
-    monthly_discretionary_minor: int | None = Field(default=None, ge=0)
-    spending_caution_threshold_minor: int | None = Field(default=None, ge=0)
+    currency: str = Field(min_length=3, max_length=3, pattern=r"^[A-Z]{3}$")
+    monthly_discretionary: Money | None = None
+    spending_caution_threshold: Money | None = None
 
 
 class EngagementLevel(StrEnum):
@@ -334,21 +382,40 @@ class InterestAttributes(EntityAttributes):
     category: str | None = None
 
 
+class LocationPrecision(StrEnum):
+    AREA = "AREA"
+    PRECISE = "PRECISE"
+
+
 class PlaceAttributes(EntityAttributes):
     """City and area are what a recommendation needs; a street address is not.
 
-    Holding one raises the record to S3, so a place that can locate the user
-    precisely can never be handed to a mind cleared only for S2.
+    The precise fields are classified individually, so a mind cleared to S2
+    receives the city and area of the same record with the address and
+    coordinates withheld, rather than losing the place entirely.
     """
+
+    SENSITIVE_FIELDS: ClassVar[Mapping[str, SensitivityLevel]] = {
+        "street_address": SensitivityLevel.S3,
+        "latitude": SensitivityLevel.S3,
+        "longitude": SensitivityLevel.S3,
+    }
 
     city: str | None = None
     area: str | None = None
     street_address: str | None = None
+    latitude: float | None = Field(default=None, ge=-90.0, le=90.0)
+    longitude: float | None = Field(default=None, ge=-180.0, le=180.0)
     is_home: bool = False
     typical_travel_minutes: int | None = Field(default=None, ge=0)
 
-    def minimum_sensitivity(self) -> SensitivityLevel | None:
-        return SensitivityLevel.S3 if self.street_address is not None else None
+    @property
+    def precision(self) -> LocationPrecision:
+        return (
+            LocationPrecision.PRECISE
+            if self.street_address is not None or self.latitude is not None
+            else LocationPrecision.AREA
+        )
 
 
 class RadarCategory(StrEnum):
@@ -365,8 +432,72 @@ class RadarItemAttributes(EntityAttributes):
 
     category: RadarCategory
     headline: str
+    price: Money | None = None
+    starts_at_is_claimed: bool = True
     place_entity_id: EntityId | None = None
     claimed_by_source: bool = True
+
+
+class RequirementKind(StrEnum):
+    """What an event needs in order to go well."""
+
+    BRING_ITEM = "BRING_ITEM"
+    WEAR = "WEAR"
+    DOCUMENT = "DOCUMENT"
+    CARRY_CASH = "CARRY_CASH"
+    PAY_BEFORE = "PAY_BEFORE"
+    ENTRY_FEE = "ENTRY_FEE"
+    PURCHASE = "PURCHASE"
+
+    @property
+    def is_monetary(self) -> bool:
+        return self in {
+            RequirementKind.CARRY_CASH,
+            RequirementKind.PAY_BEFORE,
+            RequirementKind.ENTRY_FEE,
+            RequirementKind.PURCHASE,
+        }
+
+    @property
+    def settled_before_the_event(self) -> bool:
+        """Cash carried on the day is not the same obligation as paying ahead."""
+        return self in {RequirementKind.PAY_BEFORE, RequirementKind.PURCHASE}
+
+
+class RequirementStatus(StrEnum):
+    UNKNOWN = "UNKNOWN"
+    SATISFIED = "SATISFIED"
+    AT_RISK = "AT_RISK"
+    UNSATISFIED = "UNSATISFIED"
+    WAIVED = "WAIVED"
+
+    @property
+    def blocks_readiness(self) -> bool:
+        return self in {RequirementStatus.AT_RISK, RequirementStatus.UNSATISFIED}
+
+
+class RequirementAttributes(EntityAttributes):
+    """One thing an event needs: an item, an outfit, a document or money.
+
+    Money is a first-class amount rather than a task whose title happens to
+    contain a number, and the kind distinguishes carrying cash on the day from
+    paying ahead of it.
+    """
+
+    kind: RequirementKind
+    status: RequirementStatus = RequirementStatus.UNKNOWN
+    amount: Money | None = None
+    item_entity_id: EntityId | None = None
+    quantity: int | None = Field(default=None, ge=1)
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _shape_matches_kind(self) -> Self:
+        if self.kind.is_monetary and self.amount is None:
+            raise ValueError(f"{self.kind} requires an amount")
+        if not self.kind.is_monetary and self.amount is not None:
+            raise ValueError(f"{self.kind} is not a monetary requirement")
+        return self
 
 
 class CareerRoleAttributes(EntityAttributes):
@@ -438,6 +569,7 @@ ATTRIBUTES_BY_TYPE: dict[EntityType, type[EntityAttributes]] = {
     EntityType.DOCUMENT: DocumentAttributes,
     EntityType.RADAR_ITEM: RadarItemAttributes,
     EntityType.BEHAVIOR_PATTERN: BehaviorPatternAttributes,
+    EntityType.REQUIREMENT: RequirementAttributes,
 }
 
 

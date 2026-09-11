@@ -12,7 +12,7 @@ from wplos.personal_life_graph.relationship import (
     RelationshipType,
     relationship_spec,
 )
-from wplos.shared.errors import InvariantViolation, RecordNotFound
+from wplos.shared.errors import ConcurrentModification, InvariantViolation, RecordNotFound
 
 
 class GraphStore(Protocol):
@@ -70,10 +70,27 @@ class PersonalLifeGraph:
         current = self._entities.get(entity_id)
         return history if current is None else (*history, current)
 
-    def revise_entity(self, entity_id: EntityId, revision: Entity) -> Entity:
+    def revise_entity(
+        self,
+        entity_id: EntityId,
+        revision: Entity,
+        *,
+        expected_revision: int | None = None,
+    ) -> Entity:
+        """Store the next version, optionally refusing a write built on a stale read.
+
+        Two devices editing the same open loop must not resolve by whichever
+        packet arrives last: the second write is rejected so the conflict can be
+        represented rather than lost.
+        """
         if revision.id != entity_id:
             raise InvariantViolation("a revision must keep the entity id")
-        self.get_entity(entity_id)
+        current = self.get_entity(entity_id)
+        if expected_revision is not None and current.revision != expected_revision:
+            raise ConcurrentModification(
+                f"{entity_id} is at revision {current.revision}, "
+                f"the write was built on revision {expected_revision}"
+            )
         return self.put_entity(revision)
 
     def close_entity(self, entity_id: EntityId, *, at: datetime, status: RecordStatus) -> Entity:

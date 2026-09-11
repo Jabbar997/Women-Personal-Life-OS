@@ -19,6 +19,8 @@ an interface and an in-memory bus, and no broker.
 | `subject` | who and what it is about |
 | `correlation_id` | the turn or workflow this belongs to |
 | `causation_id` | the event that caused this one |
+| `origin` | which part of the system produced it: server, device, connector, system or AI |
+| `client` | for a device submission, the client event id used for idempotency |
 | `source` | the same `SourceRef` used by the graph |
 | `sensitivity` | the same `SensitivityLevel` used by the graph |
 | `payload` | a typed model chosen by `event_type` |
@@ -35,6 +37,18 @@ an interface and an in-memory bus, and no broker.
 6. Payloads serialize. `to_json()` / `from_json()` round-trip losslessly and
    rebuild the typed payload from the registry.
 7. Event definitions never depend on a language model.
+8. An event cannot be its own cause, and the bus refuses a cause it has not
+   already seen. Causation points backwards, which is what makes a cycle
+   impossible rather than merely unlikely.
+9. A submission from a device carries a `ClientRef`. A retry over a flaky
+   network is recognised by its client event id and returns the event already
+   accepted, so retrying does not create a second commitment. Deduplication
+   never keys on message text: two identical-looking captures can be two real
+   commitments.
+
+Arrival order is not the order things happened. `occurred_at` and `recorded_at`
+stay separate, `arrived_late` says when they differ, and the log can be read in
+either `in_arrival_order()` or `in_occurrence_order()`.
 
 ## 3. Payloads
 
@@ -64,6 +78,11 @@ RECOMMENDATION_ACCEPTED | RECOMMENDATION_DISMISSED | RECOMMENDATION_IGNORED
 
 Without a record of what was offered and what became of it, a derived
 preference has no evidence behind it and cannot be revised against the facts.
+
+Capture is not a text box. `CaptureKind` covers text, voice, photo, screenshot,
+files, shared links and the share sheet, and `MediaRef` points at media held
+outside the domain — an id, a media type, a size, a checksum and a storage
+reference. No domain model ever holds bytes.
 
 The Operator's lifecycle is explicit because authorization has to be auditable:
 

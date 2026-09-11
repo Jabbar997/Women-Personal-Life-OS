@@ -24,10 +24,17 @@ class RecordStatus(StrEnum):
     INVALIDATED = "INVALIDATED"
     EXPIRED = "EXPIRED"
     ARCHIVED = "ARCHIVED"
+    SUPPRESSED = "SUPPRESSED"
 
     @property
     def negates_history(self) -> bool:
         return self is RecordStatus.INVALIDATED
+
+    @property
+    def may_be_surfaced(self) -> bool:
+        """Suppressed records stay true and stay audited; they are just not
+        shown. "Do not mention this" is not "this never happened"."""
+        return self is not RecordStatus.SUPPRESSED
 
 
 class ProvenancedRecord(BaseModel):
@@ -38,6 +45,7 @@ class ProvenancedRecord(BaseModel):
     attribution: Attribution
     temporal: TemporalValidity
     status: RecordStatus = RecordStatus.ACTIVE
+    revision: int = Field(default=1, ge=1)
     created_at: datetime
     updated_at: datetime
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
@@ -58,6 +66,10 @@ class ProvenancedRecord(BaseModel):
     @property
     def sensitivity(self) -> SensitivityLevel:
         return self.attribution.sensitivity
+
+    @property
+    def is_surfaceable(self) -> bool:
+        return self.status.may_be_surfaced
 
     def is_active_at(self, at: datetime) -> bool:
         """Was this record in force at that instant?

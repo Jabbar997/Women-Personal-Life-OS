@@ -65,6 +65,7 @@ something was*. It carries:
 | issued at | `granted_at` |
 | validity | `expires_at` |
 | Guardian decision at the time of consent | `guardian_verdict` |
+| withdrawal | `revoked_at`, `revocation_reason` |
 | user confirmation when required | `method`, `audit_ref` |
 
 `ProposedAction.material_terms` holds the facts consent was given for — a price,
@@ -85,18 +86,64 @@ the action exactly as it was presented to the user.
 this order:
 
 1. The Guardian assessment must be *about this action*
-   (`subject_action_id == action_id`), otherwise `DENY` with
-   `GUARDIAN_ASSESSMENT_MISSING`. Without this check a `BLOCK` is bypassed by
-   handing the gate an unrelated `ALLOW`.
+   (`subject_action_id == action_id`), about the same terms, issued by the
+   Guardian authority, not superseded by a newer verdict, and not stale.
+   Otherwise `DENY` with `GUARDIAN_ASSESSMENT_MISSING`,
+   `GUARDIAN_ASSESSMENT_FORGED` or `GUARDIAN_ASSESSMENT_SUPERSEDED`. Without
+   these checks a `BLOCK` is bypassed by handing the gate an unrelated or
+   home-made `ALLOW`. See ADR-008.
 2. Guardian `BLOCK` → `DENY`. No level and no authorization buys past it.
 3. Guardian `ESCALATE` → `ESCALATE`.
 4. `A0` → `DENY` with `SUGGESTION_ONLY`.
 5. `A1` → `PERMIT`, recording a Guardian caution if one was raised.
-6. `A2` / `A3` → the authorization is checked: present, for this action, for the
-   same material terms, granted by this owner, captured under a Guardian verdict
-   that permitted execution, unexpired, and of a sufficient level. `A3`
-   additionally requires an explicit confirmation rather than a standing rule,
-   and an audit reference.
+6. The offer must not have lapsed (`offer_expires_at`), otherwise
+   `REQUIRE_CONFIRMATION` with `OFFER_EXPIRED`. A screen rendered two hours ago
+   does not carry a live offer.
+7. `A2` / `A3` → the authorization is checked: present, not revoked, for this
+   action, for the same material terms, granted by this owner, captured under a
+   Guardian verdict that permitted execution, unexpired, and of a sufficient
+   level. `A3` additionally requires an explicit confirmation rather than a
+   standing rule, and an audit reference.
+
+The `action` handed to the gate must be the server's freshly derived proposal.
+A client's copy of it is an input, never a source of truth.
+
+## 6. Execution states
+
+`ExecutionState` covers what actually happens to an action:
+
+```
+PROPOSED -> AUTHORIZED | REJECTED | REVOKED | EXPIRED
+AUTHORIZED -> STARTED
+STARTED -> SUCCEEDED | PARTIALLY_SUCCEEDED | FAILED | UNKNOWN
+UNKNOWN -> SUCCEEDED | PARTIALLY_SUCCEEDED | FAILED
+SUCCEEDED -> REVERSED | COMPENSATED
+```
+
+`UNKNOWN` exists because a timeout is not a failure: `touched_the_world` is true
+for it, so a retry is not automatically safe and `ExecutionAttempt` carries the
+action's idempotency key rather than the attempt's.
+`PARTIALLY_SUCCEEDED` exists because a booking that succeeded while its calendar
+write failed is neither success nor failure, and the steps say which was which.
+
+`ReversibilityClass` separates `REVERSIBLE`, `COMPENSATABLE` and `IRREVERSIBLE`,
+so an interface cannot offer to undo a sent message.
+
+## 7. Source authority
+
+`SourceAuthorityPolicy` decides who wins when two sources disagree:
+`USER_EXPLICIT > USER_ACTION > CONNECTOR > DERIVED > INFERRED`, with recency
+breaking ties within a level. A lower authority never overwrites a higher one —
+a calendar feed replaying last week's time cannot erase the time the user
+confirmed — and a refusal is a conflict to surface, not an error to swallow.
+
+## 8. Notifications
+
+A notification is a decision to tell her, kept separate from the domain event
+that prompted it, from the attempt to deliver it, and from her opening it.
+`NotificationPolicy` sends an `S2`-or-above alert with its content withheld,
+because a lock screen is a shared context; the deep link survives so opening it
+still lands in the right place.
 
 `require_execution_authorization(...)` is the gate the Operator calls: it raises
 `AuthorizationRequired` unless the outcome is `PERMIT`.
@@ -105,7 +152,7 @@ Missing or expired authorization yields `REQUIRE_CONFIRMATION` — ask the user.
 A mismatched, insufficient or unaudited authorization yields `DENY` — something
 is wrong, do not ask, refuse.
 
-## 6. Sensitivity
+## 9. Sensitivity
 
 `evaluate_exposure` answers whether a mind may read a record:
 
@@ -124,12 +171,14 @@ user:
 Holding cycle data in a mind's working context and saying it out loud are not the
 same act, and the model keeps them apart.
 
-## 7. Where policies are used
+## 10. Where policies are used
 
 | Policy | Used by |
 | --- | --- |
 | `sensitivity.need_to_know` | `project_context`, every agent contract |
 | `execution.authorization` | the Operator, the Orchestrator's authorization routing |
 | `orchestration.conflict` | the Orchestrator's conflict handling |
+| `source.authority` | reconciling connectors, inferences and what she said |
+| `notification.disclosure` | what a push notification may say |
 
 Each agent contract names the policies it requires in `required_policies`.

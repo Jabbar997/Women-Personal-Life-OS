@@ -43,6 +43,7 @@ Write implies read. `V` marks the mind that can stop an action outright.
 | TIME | `COMMITMENT` | RP | - | WRP | RV | RP | WRX |
 | TIME | `DEADLINE` | RP | - | WRP | - | - | - |
 | TIME | `HABIT` | - | - | - | - | - | - |
+| TIME | `REQUIREMENT` | - | - | - | - | - | - |
 | TIME | `ROUTINE` | - | - | - | - | WRP | - |
 | TIME | `TASK` | RP | - | WRP | - | WRP | WRX |
 | WORK | `CAREER_ROLE` | RP | RP | - | - | - | - |

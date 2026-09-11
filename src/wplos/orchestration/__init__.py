@@ -6,6 +6,7 @@ from wplos.orchestration.conflict import (
     ConflictResolutionPolicy,
     ConflictRule,
     SuppressedClaim,
+    UnresolvedContention,
 )
 from wplos.orchestration.contract import (
     ORCHESTRATOR_CONTRACT,
@@ -27,5 +28,6 @@ __all__ = [
     "OrchestratorContract",
     "OrchestratorResponsibility",
     "SuppressedClaim",
+    "UnresolvedContention",
     "guardian_precedes_operator",
 ]

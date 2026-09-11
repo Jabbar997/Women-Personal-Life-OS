@@ -19,10 +19,16 @@ never sees the routing.
 
 ## 2. Current phase
 
-**Phase 01 — Domain Foundation, validated.** The repository holds the domain
-core only. A ten-scenario life simulation has been run against it
-(`docs/validation/foundation-validation-01.md`); two critical authority gaps
-were found and closed. Phase 02, the Orchestrator runtime, has not started.
+**Domain foundation, adversarially validated.** The repository holds the domain
+core only. Two validation passes have run against it: a ten-scenario life
+simulation (`docs/validation/foundation-validation-01.md`) and thirty
+adversarial scenarios plus mobile readiness
+(`docs/validation/adversarial-validation-v3.md`). Seven critical gaps were found
+across the two and all are closed. The Orchestrator runtime has not started.
+
+**The product is a native-feeling iOS and Android application**, with Flutter
+the likely client. No client code exists and none belongs here: the domain runs
+server-side and is the authority. See ADR-009.
 
 Already built:
 
@@ -34,10 +40,16 @@ Already built:
   execution authorization bound to material terms.
 - The agent authority matrix and the handoff map, both derived from the
   contracts and checked by tests.
+- `Money`, event `REQUIREMENT`s, `ZonedInstant`, record revisions, field-level
+  sensitivity, the execution state machine, source authority, device
+  capabilities and the notification decision/delivery split.
 
 Deliberately **not** built yet, and not to be added without a new ADR:
 
-- Any UI (Flutter, React, landing page, chat surface, Today view).
+- Any UI or client (Flutter, React, landing page, chat surface, Today view).
+- An offline sync engine, a push provider, deep-link routing, or precomputed
+  Today projections. The architecture must *permit* them; it must not assume
+  them, and it must not assume a device is reachable at the moment of an action.
 - Any LLM provider integration, DeepSeek included.
 - Authentication, payments, a marketplace, an autonomous agent loop.
 - A vector database, a graph database, Kafka, Redis, microservices.
@@ -64,8 +76,12 @@ Deliberately **not** built yet, and not to be added without a new ADR:
    authorization binds to the action's material terms. Consent to one price and
    time is not consent to another.
 7. **Known is not Shown.** Knowing something does not license showing it, or
-   handing it to a mind that does not need it.
-8. **No UI in this phase.**
+   handing it to a mind that does not need it. Sensitivity is classified per
+   field as well as per record, so a mind gets the city without the street.
+8. **The server is the authority.** A client's copy of an offer is an input.
+   Terms, consent, the Guardian verdict and availability are revalidated
+   server-side before anything happens, however recently the screen was drawn.
+9. **No UI or client in this phase.**
 
 ## 4. Authority boundaries
 
@@ -125,10 +141,16 @@ them.
   and the model refuses an inferential source that claims certainty.
 - Sensitivity defaults: cycle, pregnancy, health, body signals, purchases and
   money context are `S3`; calendar, people and places are `S2`.
-- Closing a record is two different acts. `superseded()` means it stopped being
-  true and history keeps it; `invalidated()` means it was never true and it is
-  never read back as history. Only `INVALIDATED` is retroactive. Choosing the
-  wrong one corrupts every as-of query.
+- Closing a record is three different acts. `superseded()` means it stopped
+  being true and history keeps it; `invalidated()` means it was never true and
+  it is never read back as history; `suppressed()` means do not mention it,
+  while it stays true and audited. Only `INVALIDATED` is retroactive. Choosing
+  the wrong one corrupts every as-of query.
+- A time is an instant plus the zone it is anchored to. Never render an event in
+  the user's current zone, and never resolve a DST gap or fold by guessing —
+  `ZonedInstant.from_local` refuses unless the caller states a policy.
+- Money is `Money`: integer minor units and a currency. Never a float, never a
+  number inside a string.
 
 ## 7. Testing rules
 
@@ -165,7 +187,12 @@ them.
 - Widening a contract to make a test pass.
 - Putting a price, a time or a recipient in `parameters` instead of
   `material_terms`. Anything outside `material_terms` is not covered by consent.
-- Handing the execution gate a Guardian assessment of a different action.
+- Handing the execution gate a Guardian assessment of a different action, or one
+  the Guardian authority did not issue.
+- Passing the gate an action a client sent back instead of one the server just
+  derived.
+- Writing a record over another without checking its `revision`.
+- Putting bytes in a domain model, or a device id in the graph.
 - Editing `docs/domain/agent-authority-matrix.md` by hand.
 
 ## 10. Source-of-truth documents
@@ -179,7 +206,7 @@ them.
 | Policy | `docs/domain/policy-model.md` |
 | Agent authority | `docs/domain/agent-authority-matrix.md` (generated) |
 | Agent handoffs | `docs/domain/agent-handoffs.md` |
-| Validation | `docs/validation/foundation-validation-01.md` |
+| Validation | `docs/validation/foundation-validation-01.md`, `docs/validation/adversarial-validation-v3.md` |
 | Decisions | `docs/adr/` |
 
 ## 11. Next phase, when it is authorized

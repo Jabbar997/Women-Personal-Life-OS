@@ -16,3 +16,7 @@ class UnknownEventType(DomainError):
 
 class AuthorizationRequired(DomainError):
     """An action was attempted without the authorization its permission level requires."""
+
+
+class ConcurrentModification(DomainError):
+    """A write was built on a revision that is no longer current."""
