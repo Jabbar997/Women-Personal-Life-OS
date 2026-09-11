@@ -1,0 +1,77 @@
+# Event Model
+
+Every significant change in the system must be expressible as a domain event.
+That is a modelling commitment, not an infrastructure purchase: this phase ships
+an interface and an in-memory bus, and no broker.
+
+## 1. Envelope
+
+`DomainEvent` is frozen. A recorded event is history.
+
+| Field | Meaning |
+| --- | --- |
+| `event_id` | identity of this event |
+| `event_type` | a value from the `EventType` catalog, never a string literal |
+| `schema_version` | payload shape version, so payloads can evolve |
+| `occurred_at` | when it happened in the world |
+| `recorded_at` | when the system wrote it down |
+| `actor` | who acted: `USER`, `AGENT` (naming the mind), `ORCHESTRATOR`, `CONNECTOR`, `SYSTEM` |
+| `subject` | who and what it is about |
+| `correlation_id` | the turn or workflow this belongs to |
+| `causation_id` | the event that caused this one |
+| `source` | the same `SourceRef` used by the graph |
+| `sensitivity` | the same `SensitivityLevel` used by the graph |
+| `payload` | a typed model chosen by `event_type` |
+| `metadata` | incidental `JsonValue` data |
+
+## 2. Rules
+
+1. A recorded event is never modified. The model is frozen; a mutation raises.
+2. A change is a new event, never an edit. A correction is an event too.
+3. Every event carries `schema_version`.
+4. Every event carries `correlation_id`.
+5. Every consequence carries `causation_id`. `event.caused(...)` derives a
+   consequence, carrying the correlation forward and setting causation.
+6. Payloads serialize. `to_json()` / `from_json()` round-trip losslessly and
+   rebuild the typed payload from the registry.
+7. Event definitions never depend on a language model.
+
+## 3. Payloads
+
+`PAYLOAD_BY_EVENT` maps every `EventType` to a payload model; a test fails if
+any event type is unmapped. Payload fields use domain enums
+(`OpenLoopState`, `CyclePhase`, `AvailabilityState`, `GuardianVerdict`,
+`PermissionLevel`, `ActionDomain`, …) rather than loose strings.
+
+Reused shapes keep the catalog small: `EntityRefPayload` for simple
+created/updated events, `OpenLoopPayload` for tasks and commitments,
+`OperatorActionResultPayload` for the Operator's lifecycle outcomes.
+
+## 4. Catalog
+
+Profile · Goals · Commitments · Tasks · Deadlines · Calendar events · Calendar
+conflict · Capture · Memory · Preference and behaviour · Products · Wardrobe ·
+Cycle · Mood, energy, sleep · Weather · Radar · Guardian · Readiness · Operator.
+
+The Operator's lifecycle is explicit because authorization has to be auditable:
+
+```
+OPERATOR_ACTION_PROPOSED
+OPERATOR_ACTION_AUTHORIZED | OPERATOR_ACTION_REJECTED
+OPERATOR_ACTION_STARTED
+OPERATOR_ACTION_SUCCEEDED | OPERATOR_ACTION_FAILED
+OPERATOR_ACTION_REVERSED
+```
+
+The full list lives in `src/wplos/events/types.py` and is the single source of
+truth.
+
+## 5. Bus
+
+`EventBus` is the port a real broker would implement later.
+`InMemoryEventBus` is an append-only log with synchronous fan-out. It refuses to
+publish the same `event_id` twice, and offers `correlation()` and
+`causation_chain()` so a turn can be reconstructed from its root cause forward.
+
+Nothing here requires Kafka or Redis, and neither should be added until a real
+need appears in an ADR.
