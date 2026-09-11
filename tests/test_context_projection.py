@@ -5,6 +5,7 @@ from datetime import datetime
 from wplos.agents.navigator import NAVIGATOR_CONTRACT
 from wplos.agents.readiness import READINESS_CONTRACT
 from wplos.core.identifiers import UserId
+from wplos.core.purpose import Purpose
 from wplos.core.roles import AgentName
 from wplos.core.sensitivity import SensitivityLevel
 from wplos.personal_life_graph.context import ContextScope, RedactionScope, project_context
@@ -28,7 +29,7 @@ def test_s3_data_is_withheld_from_a_consumer_that_does_not_require_it(
 ) -> None:
     broad_scope = ContextScope(
         consumer=AgentName.NAVIGATOR,
-        purpose="decide what matters this week",
+        purpose=Purpose.DIRECTION_CHECK,
         required_entity_types=frozenset(),
         max_sensitivity=SensitivityLevel.S3,
     )
@@ -49,7 +50,7 @@ def test_readiness_receives_cycle_context_because_its_contract_requires_it(
     cycle_state: Entity,
     now: datetime,
 ) -> None:
-    scope = READINESS_CONTRACT.context_scope("prepare for tomorrow morning")
+    scope = READINESS_CONTRACT.context_scope(Purpose.GET_READY)
 
     view = project_context(graph, owner_id=owner, scope=scope, at=now)
 
@@ -64,7 +65,7 @@ def test_navigator_never_reaches_cycle_context_at_all(
     goal: Entity,
     now: datetime,
 ) -> None:
-    scope = NAVIGATOR_CONTRACT.context_scope("weekly direction check")
+    scope = NAVIGATOR_CONTRACT.context_scope(Purpose.DIRECTION_CHECK)
 
     view = project_context(graph, owner_id=owner, scope=scope, at=now)
 
@@ -79,7 +80,7 @@ def test_a_consumer_above_its_ceiling_is_denied_by_the_policy() -> None:
             consumer_ceiling=SensitivityLevel.S2,
             record_sensitivity=SensitivityLevel.S3,
             explicitly_required=True,
-            purpose="rank nearby events",
+            purpose=Purpose.FIND_LOCAL_EVENT,
         )
     )
 

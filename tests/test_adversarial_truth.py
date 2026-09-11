@@ -7,6 +7,7 @@ from wplos.agents.radar import RADAR_CONTRACT
 from wplos.core.attribution import Attribution
 from wplos.core.identifiers import UserId
 from wplos.core.provenance import SourceType
+from wplos.core.purpose import Purpose
 from wplos.core.records import RecordStatus
 from wplos.core.sensitivity import SensitivityLevel
 from wplos.core.temporal import TemporalMarkers
@@ -96,7 +97,7 @@ def test_radar_stops_seeing_a_withdrawn_preference_but_the_record_survives(
     )
     graph.supersede_memory(liked.id, at=month_later, reason="she asked us to stop suggesting it")
 
-    scope = RADAR_CONTRACT.context_scope("suggest classes nearby")
+    scope = RADAR_CONTRACT.context_scope(Purpose.FIND_LOCAL_EVENT)
     view = project_context(graph, owner_id=owner, scope=scope, at=month_later + timedelta(days=1))
 
     assert all(memory.id != liked.id for memory in view.memories)
@@ -381,7 +382,7 @@ def test_a_sensitive_conclusion_stays_sensitive_whatever_inferred_it(
     assert inferred_from_behaviour.sensitivity is SensitivityLevel.S3
     assert not inferred_from_behaviour.confidence.is_certain
 
-    scope = RADAR_CONTRACT.context_scope("suggest classes nearby")
+    scope = RADAR_CONTRACT.context_scope(Purpose.FIND_LOCAL_EVENT)
     assert not scope.max_sensitivity.dominates(SensitivityLevel.S3)
 
 

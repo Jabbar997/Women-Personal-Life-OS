@@ -1,5 +1,6 @@
 from pydantic import BaseModel, ConfigDict
 
+from wplos.core.purpose import Purpose
 from wplos.core.roles import AgentName
 from wplos.core.sensitivity import SensitivityLevel
 from wplos.policy.decisions import PolicyDecision, ReasonCode, reason
@@ -17,7 +18,7 @@ class ExposureRequest(BaseModel):
     consumer_ceiling: SensitivityLevel
     record_sensitivity: SensitivityLevel
     explicitly_required: bool
-    purpose: str
+    purpose: Purpose
 
 
 class SurfaceRequest(BaseModel):

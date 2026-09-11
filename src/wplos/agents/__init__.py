@@ -10,8 +10,10 @@ from wplos.agents.contracts import (
     AgentRequest,
     DecisionState,
     EvidenceKind,
+    GraphWriteIntent,
     Intent,
     PriorityClass,
+    WriteOperation,
 )
 from wplos.agents.guardian import GUARDIAN_CONTRACT
 from wplos.agents.life_admin import LIFE_ADMIN_CONTRACT
@@ -40,10 +42,12 @@ __all__ = [
     "AgentRequest",
     "DecisionState",
     "EvidenceKind",
+    "GraphWriteIntent",
     "Intent",
     "PriorityClass",
     "RadarClassification",
     "ReadinessMode",
     "ReadinessOutputKind",
+    "WriteOperation",
     "contract_for",
 ]

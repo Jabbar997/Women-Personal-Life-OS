@@ -5,8 +5,9 @@ from typing import Protocol, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wplos.core.confidence import Confidence
-from wplos.core.identifiers import CorrelationId, RequestId, UserId
+from wplos.core.identifiers import CorrelationId, EntityId, RequestId, UserId
 from wplos.core.provenance import SourceRef
+from wplos.core.purpose import Purpose
 from wplos.core.roles import AgentName
 from wplos.core.sensitivity import SensitivityLevel
 from wplos.events.envelope import DomainEvent
@@ -130,6 +131,29 @@ class AgentRecommendation(BaseModel):
         return self
 
 
+class WriteOperation(StrEnum):
+    CREATE = "CREATE"
+    REVISE = "REVISE"
+    CLOSE = "CLOSE"
+
+
+class GraphWriteIntent(BaseModel):
+    """A mind asking for a change to the graph.
+
+    Minds do not write. They ask, through their output, and the application
+    layer refuses anything outside the contract. A mind holding a reference to
+    the graph and calling it directly would make every ``writes`` declaration
+    decorative.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    entity_type: EntityType
+    operation: WriteOperation
+    entity_id: EntityId | None = None
+    summary: str
+
+
 class AgentContext(BaseModel):
     """Everything a mind may read for this turn, already filtered."""
 
@@ -158,7 +182,9 @@ class AgentOutput(BaseModel):
     decisions: tuple[AgentDecision, ...] = Field(default_factory=tuple)
     recommendations: tuple[AgentRecommendation, ...] = Field(default_factory=tuple)
     events: tuple[DomainEvent, ...] = Field(default_factory=tuple)
-    guardian_assessment: GuardianAssessment | None = None
+    writes: tuple[GraphWriteIntent, ...] = Field(default_factory=tuple)
+    assessments: tuple[GuardianAssessment, ...] = Field(default_factory=tuple)
+    """Guardian's verdicts, one per action it was shown."""
 
     @property
     def highest_priority(self) -> PriorityClass | None:
@@ -200,7 +226,7 @@ class AgentContract(BaseModel):
             raise ValueError(f"{self.agent} must not hold ACT authority")
         return self
 
-    def context_scope(self, purpose: str) -> ContextScope:
+    def context_scope(self, purpose: Purpose) -> ContextScope:
         return ContextScope(
             consumer=self.agent,
             purpose=purpose,

@@ -3,6 +3,7 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from wplos.shared.errors import InvariantViolation
+from wplos.shared.json import JsonValue
 
 
 class Money(BaseModel):
@@ -57,6 +58,6 @@ class Money(BaseModel):
     def is_zero(self) -> bool:
         return self.amount_minor == 0
 
-    def as_terms(self) -> dict[str, int | str]:
+    def as_terms(self) -> dict[str, JsonValue]:
         """The shape money takes inside an action's material terms."""
         return {"amount_minor": self.amount_minor, "currency": self.currency}

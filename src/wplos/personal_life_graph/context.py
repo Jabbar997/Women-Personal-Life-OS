@@ -4,6 +4,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field
 
 from wplos.core.identifiers import UserId
+from wplos.core.purpose import Purpose
 from wplos.core.roles import AgentName
 from wplos.core.sensitivity import SensitivityLevel
 from wplos.personal_life_graph.entity import Entity
@@ -30,7 +31,7 @@ class ContextScope(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     consumer: AgentName
-    purpose: str
+    purpose: Purpose
     required_entity_types: frozenset[EntityType] = Field(default_factory=frozenset)
     required_memory_types: frozenset[MemoryType] = Field(default_factory=frozenset)
     max_sensitivity: SensitivityLevel = SensitivityLevel.S1

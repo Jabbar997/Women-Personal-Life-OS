@@ -11,6 +11,7 @@ from wplos.core.identifiers import (
     IdempotencyKeyLike,
     MemoryId,
     NotificationId,
+    RequestId,
 )
 from wplos.core.provenance import SourceType
 from wplos.core.roles import AgentName
@@ -188,6 +189,37 @@ class RequirementPayload(EventPayload):
 class RequirementStatusChangedPayload(RequirementPayload):
     previous_status: RequirementStatus
     cause_entity_id: EntityId | None = None
+
+
+class OrchestrationPayload(EventPayload):
+    """A run happened. The domain cares that the system reasoned, not how.
+
+    Per-agent timings and routing live in the runtime trace, which is an
+    application artefact; only these few facts are worth keeping forever.
+    """
+
+    runtime_request_id: RequestId
+    trigger: str
+    agents: tuple[AgentName, ...] = Field(default_factory=tuple)
+
+
+class OrchestrationOutcomePayload(OrchestrationPayload):
+    status: str
+    item_count: int = Field(ge=0)
+    suppressed_count: int = Field(ge=0)
+
+
+class ActionPlanPayload(EventPayload):
+    runtime_request_id: RequestId
+    item_count: int = Field(ge=0)
+    authorization_count: int = Field(ge=0)
+
+
+class AuthorizationRequestedPayload(EventPayload):
+    action_id: ActionId
+    permission_level: PermissionLevel
+    domain: ActionDomain
+    high_impact: bool
 
 
 class NotificationPayload(EventPayload):
@@ -386,6 +418,11 @@ PAYLOAD_BY_EVENT: dict[EventType, type[EventPayload]] = {
     EventType.SOURCE_CONFLICT_DETECTED: SourceConflictPayload,
     EventType.REQUIREMENT_CREATED: RequirementPayload,
     EventType.REQUIREMENT_STATUS_CHANGED: RequirementStatusChangedPayload,
+    EventType.ORCHESTRATION_STARTED: OrchestrationPayload,
+    EventType.ORCHESTRATION_COMPLETED: OrchestrationOutcomePayload,
+    EventType.ORCHESTRATION_FAILED: OrchestrationOutcomePayload,
+    EventType.ACTION_PLAN_CREATED: ActionPlanPayload,
+    EventType.AUTHORIZATION_REQUESTED: AuthorizationRequestedPayload,
     EventType.NOTIFICATION_RAISED: NotificationPayload,
     EventType.NOTIFICATION_SUPPRESSED: NotificationPayload,
     EventType.NOTIFICATION_DISPATCHED: DeliveryPayload,

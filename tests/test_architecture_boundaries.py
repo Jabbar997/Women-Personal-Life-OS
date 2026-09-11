@@ -48,6 +48,7 @@ LAYERS: dict[str, int] = {
     "events": 4,
     "agents": 5,
     "orchestration": 6,
+    "application": 7,
 }
 
 

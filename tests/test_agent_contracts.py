@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from wplos.agents.contracts import AgentContract, DecisionState, Intent, PriorityClass
 from wplos.agents.registry import AGENT_CONTRACTS, contract_for
+from wplos.core.purpose import Purpose
 from wplos.core.roles import AgentName
 from wplos.orchestration.contract import (
     ORCHESTRATOR_CONTRACT,
@@ -54,7 +55,7 @@ def test_guardian_writes_nothing_to_the_graph() -> None:
 
 def test_a_contract_projects_the_context_scope_it_is_allowed_to_read() -> None:
     readiness = contract_for(AgentName.READINESS)
-    scope = readiness.context_scope("get ready for the morning")
+    scope = readiness.context_scope(Purpose.GET_READY)
 
     assert scope.consumer is AgentName.READINESS
     assert scope.required_entity_types == readiness.reads

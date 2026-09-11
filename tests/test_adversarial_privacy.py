@@ -7,6 +7,7 @@ from wplos.agents.contracts import DecisionState
 from wplos.agents.radar import RADAR_CONTRACT
 from wplos.agents.registry import contract_for
 from wplos.core.identifiers import UserId
+from wplos.core.purpose import Purpose
 from wplos.core.roles import AgentName
 from wplos.core.sensitivity import SensitivityLevel
 from wplos.personal_life_graph.attributes import (
@@ -75,7 +76,7 @@ def test_asking_for_the_city_does_not_hand_over_the_street(
     view = project_context(
         graph,
         owner_id=owner,
-        scope=RADAR_CONTRACT.context_scope("rank events near her"),
+        scope=RADAR_CONTRACT.context_scope(Purpose.FIND_LOCAL_EVENT),
         at=now,
     )
 
@@ -98,7 +99,7 @@ def test_the_withheld_field_names_are_recorded_but_not_their_values(
     view = project_context(
         graph,
         owner_id=owner,
-        scope=RADAR_CONTRACT.context_scope("rank events near her"),
+        scope=RADAR_CONTRACT.context_scope(Purpose.FIND_LOCAL_EVENT),
         at=now,
     )
 
@@ -119,7 +120,7 @@ def test_over_redaction_is_avoided_without_under_redaction(
         owner_id=owner,
         scope=ContextScope(
             consumer=AgentName.READINESS,
-            purpose="work out when she needs to leave",
+            purpose=Purpose.GET_READY,
             required_entity_types=frozenset({EntityType.PLACE}),
             max_sensitivity=SensitivityLevel.S3,
         ),
@@ -159,7 +160,7 @@ def test_radar_never_reaches_a_sensitive_state_through_a_permitted_edge(
     view = project_context(
         graph,
         owner_id=owner,
-        scope=RADAR_CONTRACT.context_scope("suggest activities"),
+        scope=RADAR_CONTRACT.context_scope(Purpose.FIND_LOCAL_EVENT),
         at=now,
     )
 
@@ -199,7 +200,7 @@ def test_an_edge_is_only_delivered_when_both_ends_were_needed(
     radar_view = project_context(
         graph,
         owner_id=owner,
-        scope=RADAR_CONTRACT.context_scope("suggest activities"),
+        scope=RADAR_CONTRACT.context_scope(Purpose.FIND_LOCAL_EVENT),
         at=now,
     )
 
@@ -234,7 +235,7 @@ def test_an_edge_whose_endpoint_types_are_not_required_is_withheld(
         owner_id=owner,
         scope=ContextScope(
             consumer=AgentName.LIFE_ADMIN,
-            purpose="chase open loops",
+            purpose=Purpose.CLOSE_OPEN_LOOPS,
             required_entity_types=frozenset({EntityType.PERSON}),
             max_sensitivity=SensitivityLevel.S3,
         ),
@@ -279,7 +280,7 @@ def test_radar_cannot_read_cycle_history_even_at_its_own_ceiling(
 ) -> None:
     greedy = ContextScope(
         consumer=AgentName.RADAR,
-        purpose="rank events",
+        purpose=Purpose.FIND_LOCAL_EVENT,
         required_entity_types=frozenset({EntityType.CYCLE_STATE}),
         max_sensitivity=RADAR_CONTRACT.max_sensitivity,
     )
@@ -300,7 +301,7 @@ def test_a_minds_scope_is_exactly_its_contract_and_never_wider() -> None:
     """A scope is derived, so a mind cannot widen its own reach by asking."""
     for agent in AgentName:
         contract = contract_for(agent)
-        scope = contract.context_scope("routine work")
+        scope = contract.context_scope(Purpose.PLAN_DAY)
 
         assert scope.consumer is agent
         assert scope.max_sensitivity is contract.max_sensitivity

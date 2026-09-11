@@ -6,10 +6,11 @@ minds and an orchestrator on the inside.
 It is not a period tracker, a beauty app, a planner, a deals app, a generic AI
 chatbot, or a super-app stitched together from separate features.
 
-> **Current phase: domain foundation, adversarially validated.**
-> This repository contains the domain core only: the Personal Life Graph, the
-> event model, the agent contracts and the policy primitives. There is no UI, no
-> API, no LLM integration and no database yet, by design.
+> **Current phase: Orchestrator Runtime.**
+> The domain core — Personal Life Graph, event model, agent contracts, policy
+> primitives — plus an executable decision runtime that coordinates the six
+> minds. Six deterministic reference minds prove the machinery works; no model
+> is connected. There is no UI, no API and no database yet, by design.
 >
 > The product is a native-feeling iOS and Android application. The client is not
 > built yet, and when it is, it will be a presentation and cache layer: the
@@ -51,6 +52,7 @@ src/wplos/
   events/               event catalog, typed payloads, envelope, in-memory bus
   agents/               the six contracts and the shared agent abstractions
   orchestration/        orchestrator contract and conflict resolution
+  application/          the runtime: routing, planning, context, composition
 tests/                  domain tests, including the architecture boundary suite
 docs/                   architecture, domain and decision records
 ```
@@ -58,7 +60,7 @@ docs/                   architecture, domain and decision records
 Imports only ever point one way, and a test enforces it:
 
 ```
-shared -> core -> policy -> personal_life_graph -> events -> agents -> orchestration
+shared -> core -> policy -> personal_life_graph -> events -> agents -> orchestration -> application
 ```
 
 ## Getting started
@@ -88,6 +90,7 @@ test suite. All four must pass before anything is pushed.
 | [`docs/domain/agent-handoffs.md`](docs/domain/agent-handoffs.md) | The permitted passes of work between minds. |
 | [`docs/validation/foundation-validation-01.md`](docs/validation/foundation-validation-01.md) | The ten-scenario life simulation and what it broke. |
 | [`docs/validation/adversarial-validation-v3.md`](docs/validation/adversarial-validation-v3.md) | Thirty adversarial scenarios, mobile readiness, and the gaps they closed. |
+| [`docs/runtime/`](docs/runtime/) | How the runtime routes, plans, composes and fails. |
 | [`docs/adr/`](docs/adr/) | Architecture decision records. |
 
 ## Licence

@@ -19,8 +19,9 @@ never sees the routing.
 
 ## 2. Current phase
 
-**Domain foundation, adversarially validated.** The repository holds the domain
-core only. Two validation passes have run against it: a ten-scenario life
+**Phase 04 — Orchestrator Runtime.** The domain core plus an executable
+decision runtime in `src/wplos/application/`. Six deterministic reference minds
+prove the machinery; no model is connected to anything. Two validation passes have run against it: a ten-scenario life
 simulation (`docs/validation/foundation-validation-01.md`) and thirty
 adversarial scenarios plus mobile readiness
 (`docs/validation/adversarial-validation-v3.md`). Seven critical gaps were found
@@ -43,10 +44,20 @@ Already built:
 - `Money`, event `REQUIREMENT`s, `ZonedInstant`, record revisions, field-level
   sensitivity, the execution state machine, source authority, device
   capabilities and the notification decision/delivery split.
+- The runtime: `RuntimeRequest`/`RuntimeResult`, declarative routing, a
+  dependency DAG with cycle rejection, purpose-bound context, the agent port,
+  contract enforcement, conflict and priority resolution, the Action Composer
+  with a budget and typed suppression, authorization routing and a runtime
+  trace.
 
 Deliberately **not** built yet, and not to be added without a new ADR:
 
 - Any UI or client (Flutter, React, landing page, chat surface, Today view).
+- Any LLM provider behind the agent port. The reference minds are deterministic
+  and are not the product.
+- An HTTP API. The runtime is tested by calling it.
+- Real connectors, bookings, payments or messaging. The Operator executes
+  in-memory only, to prove the flow.
 - An offline sync engine, a push provider, deep-link routing, or precomputed
   Today projections. The architecture must *permit* them; it must not assume
   them, and it must not assume a device is reachable at the moment of an action.
@@ -126,8 +137,10 @@ them.
 - Do not add a dependency without an ADR. Runtime dependencies are pydantic and
   nothing else.
 - Imports point one way only:
-  `shared -> core -> policy -> personal_life_graph -> events -> agents -> orchestration`.
-  A test enforces this.
+  `shared -> core -> policy -> personal_life_graph -> events -> agents -> orchestration -> application`.
+  A test enforces this. `application/` is the runtime; the domain never imports it.
+- Domain model, API contract and mobile view model stay three separate things.
+  `ComposedActionPlan` is an application model, not a screen.
 
 ## 6. Time, provenance, confidence, sensitivity
 
@@ -192,6 +205,12 @@ them.
 - Passing the gate an action a client sent back instead of one the server just
   derived.
 - Writing a record over another without checking its `revision`.
+- Putting business reasoning in the Orchestrator. It routes, coordinates,
+  enforces, composes and records; it holds no opinion about a life.
+- Letting the Orchestrator write to the graph, or a mind write outside its
+  contract's `writes`.
+- Executing an action Guardian did not assess. Silence is not consent.
+- Dropping an item from a plan without a typed suppression reason.
 - Putting bytes in a domain model, or a device id in the graph.
 - Editing `docs/domain/agent-authority-matrix.md` by hand.
 
@@ -206,6 +225,7 @@ them.
 | Policy | `docs/domain/policy-model.md` |
 | Agent authority | `docs/domain/agent-authority-matrix.md` (generated) |
 | Agent handoffs | `docs/domain/agent-handoffs.md` |
+| Runtime | `docs/runtime/orchestrator-runtime.md`, `routing.md`, `action-composer.md`, `failure-policy.md` |
 | Validation | `docs/validation/foundation-validation-01.md`, `docs/validation/adversarial-validation-v3.md` |
 | Decisions | `docs/adr/` |
 

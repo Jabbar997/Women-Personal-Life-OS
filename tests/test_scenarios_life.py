@@ -19,6 +19,7 @@ from wplos.core.attribution import Attribution
 from wplos.core.confidence import Confidence
 from wplos.core.identifiers import EntityId, UserId
 from wplos.core.provenance import SourceType
+from wplos.core.purpose import Purpose
 from wplos.core.records import RecordStatus
 from wplos.core.roles import AgentName
 from wplos.core.sensitivity import SensitivityLevel
@@ -805,7 +806,7 @@ def test_scenario_09_radar_gets_the_city_and_nothing_else(
     view = project_context(
         graph,
         owner_id=owner,
-        scope=RADAR_CONTRACT.context_scope("rank nearby events this week"),
+        scope=RADAR_CONTRACT.context_scope(Purpose.FIND_LOCAL_EVENT),
         at=now,
     )
     delivered = {entity.entity_type for entity in view.entities}
