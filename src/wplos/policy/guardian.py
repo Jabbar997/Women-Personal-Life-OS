@@ -51,7 +51,9 @@ class GuardianAssessment(BaseModel):
     findings: tuple[GuardianFinding, ...] = Field(default_factory=tuple)
 
     @classmethod
-    def allow(cls, subject_action_id: ActionId | None = None) -> "GuardianAssessment":
+    def allow(cls, subject_action_id: ActionId) -> "GuardianAssessment":
+        """An assessment always names what it assessed; a verdict floating free
+        of its subject is how a BLOCK gets bypassed."""
         return cls(subject_action_id=subject_action_id, verdict=GuardianVerdict.ALLOW)
 
     @classmethod

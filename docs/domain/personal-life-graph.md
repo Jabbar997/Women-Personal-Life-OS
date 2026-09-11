@@ -90,7 +90,12 @@ EVENT  REQUIRES       ITEM
 GOAL   SUPPORTED_BY   COURSE
 PERSON RELATED_TO     PERSON      (symmetric)
 ITEM   HAS_STATUS     AVAILABILITY_STATE
+EVENT  CONFLICTS_WITH EVENT       (symmetric)
 ```
+
+`CONFLICTS_WITH` makes a clash between two commitments durable state rather than
+a transient observation: the graph can be asked what collides on Thursday, not
+just replayed until a conflict event reappears.
 
 An edge whose meaning does not depend on its endpoints (`OWNS`, `LOCATED_AT`,
 `PREPARES_FOR`, `BLOCKS`, `DERIVED_FROM`, `ATTENDS`, `ASSIGNED_TO`) is left
@@ -110,7 +115,29 @@ A calendar event's start is its `scheduled_for` marker; only the end of the
 interval lives in attributes. Naive datetimes are rejected at the boundary:
 ambiguous time is a correctness bug, and time arithmetic is a rules concern.
 
-## 6. Nothing is deleted
+## 6. Closing a record: wrong versus no longer true
+
+`RecordStatus` separates two things that are easy to conflate and dangerous to
+mix:
+
+| Status | Meaning | Readable as history? |
+| --- | --- | --- |
+| `ACTIVE` | in force now | yes |
+| `SUPERSEDED` | was true, replaced | yes |
+| `EXPIRED` | was true, its time ran out | yes |
+| `ARCHIVED` | was true, moved out of the working set | yes |
+| `INVALIDATED` | was never true; we were wrong | **no** |
+
+Only `INVALIDATED` is retroactive (`RecordStatus.negates_history`). Everything
+else stays visible to an as-of query, so closing a record today does not rewrite
+what the graph says about last month. `is_active_at(at)` asks "was this in force
+then", not "is this the current row".
+
+For memories the two are separate methods: `superseded()` when she changed, and
+`invalidated()` when the system was wrong. Using the wrong one is a
+history-integrity bug, not a naming preference.
+
+## 7. Nothing is deleted
 
 - An entity is revised into a new version; `entity_versions()` returns the full
   history and `created_at` survives.
@@ -120,7 +147,7 @@ ambiguous time is a correctness bug, and time arithmetic is a rules concern.
   visible "then", and is still retrievable by id.
 - A memory is invalidated with a reason recorded in metadata.
 
-## 7. Provenance
+## 8. Provenance
 
 `SourceRef` answers where a fact came from:
 
@@ -132,7 +159,7 @@ BEHAVIORAL_INFERENCE · CALENDAR · EXTERNAL_CONNECTOR · RADAR · OPERATOR_RESU
 `AI_INFERRED`, `BEHAVIORAL_INFERENCE` and `RADAR` are *inferential*. Radar is
 inferential on purpose: an advertisement is a claim, not a fact.
 
-## 8. Confidence
+## 9. Confidence
 
 `Confidence` is either `CERTAIN` (no probability attached) or `PROBABILISTIC`
 (a value in `0.0 → 1.0`). "My favourite activity is Pilates" is certain;
@@ -142,7 +169,7 @@ source claiming certainty is rejected by `Attribution`.
 `score` gives a comparable scalar (`1.0` for certain) without pretending
 certainty is a probability.
 
-## 9. Sensitivity
+## 10. Sensitivity
 
 | Level | Meaning | Examples |
 | --- | --- | --- |
@@ -153,7 +180,14 @@ certainty is a probability.
 
 Sensitivity is part of the model from the start, not a later feature.
 
-## 10. Memory
+Sensitivity is per record, which leaves a trap: an attribute sharper than its
+type's default would force a choice between over-classifying the whole record
+and dropping the field. `EntityAttributes.minimum_sensitivity()` closes it by
+raising the record's floor. A `PLACE` is `S2` and carries a city and an area;
+one carrying a `street_address` must be `S3` or it cannot be constructed. The
+area still reaches Radar; the address never can.
+
+## 11. Memory
 
 `MemoryType` is `FACT`, `PREFERENCE`, `BEHAVIOR`, `DECISION`, `RELATIONSHIP`,
 `TEMPORAL`. A record carries `source`, `confidence`, `last_confirmed_at`,
@@ -163,7 +197,7 @@ A declared memory is confirmed the moment it is stored; an inferred one is not
 confirmed until something authoritative confirms it. No vector database is
 involved and none is needed at this layer.
 
-## 11. Known is not Shown
+## 12. Known is not Shown
 
 A mind never queries the graph. It receives a `ContextView` built by
 `project_context` from its contract's `ContextScope`, which carries the entity

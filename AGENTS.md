@@ -19,7 +19,10 @@ never sees the routing.
 
 ## 2. Current phase
 
-**Phase 01 — Domain Foundation.** The repository holds the domain core only.
+**Phase 01 — Domain Foundation, validated.** The repository holds the domain
+core only. A ten-scenario life simulation has been run against it
+(`docs/validation/foundation-validation-01.md`); two critical authority gaps
+were found and closed. Phase 02, the Orchestrator runtime, has not started.
 
 Already built:
 
@@ -28,7 +31,9 @@ Already built:
 - Event model: envelope, catalog, typed payloads, in-memory bus.
 - Agent contracts for the six minds plus the Orchestrator contract.
 - Policy primitives: permission levels, Guardian verdicts, sensitivity policy,
-  execution authorization.
+  execution authorization bound to material terms.
+- The agent authority matrix and the handoff map, both derived from the
+  contracts and checked by tests.
 
 Deliberately **not** built yet, and not to be added without a new ADR:
 
@@ -55,7 +60,9 @@ Deliberately **not** built yet, and not to be added without a new ADR:
    `BLOCK`, `ESCALATE`. Nothing overrides a `BLOCK`.
 6. **The Operator never executes high-impact actions silently.** Payment,
    purchase, legal, medical, sensitive communication, sensitive data sharing and
-   destructive external actions always require authorization.
+   destructive external actions always require authorization, and that
+   authorization binds to the action's material terms. Consent to one price and
+   time is not consent to another.
 7. **Known is not Shown.** Knowing something does not license showing it, or
    handing it to a mind that does not need it.
 8. **No UI in this phase.**
@@ -76,6 +83,13 @@ Operator may hold `ACT` or an executable permission level; only Guardian may
 hold a veto. The Orchestrator owns no business domain and cannot override
 Guardian.
 
+The full object-level matrix is generated from these contracts into
+`docs/domain/agent-authority-matrix.md` — never edit it by hand, run
+`scripts/generate_authority_matrix.py`. Permitted passes of work between minds
+are in `docs/domain/agent-handoffs.md` and in `AGENT_HANDOFFS`; a handoff must
+actually connect, meaning the source produces the events and the target consumes
+them.
+
 ## 5. Coding conventions
 
 - Python 3.13. Typed code, `mypy --strict` with `disallow_any_explicit`.
@@ -87,6 +101,9 @@ Guardian.
   `metadata: dict[str, JsonValue]`; anything meaningful gets a schema.
 - Every `EntityType` must register an attributes model, and every `EventType`
   must register a payload model. Tests enforce both.
+- Attributes that can hold something sharper than their type's default raise the
+  record's floor through `minimum_sensitivity()`, rather than relying on the
+  caller to classify correctly.
 - Small, cohesive modules. Explicit domain names over clever ones.
 - Docstrings only where they add something the signature does not. Never write a
   comment that restates the line below it.
@@ -108,6 +125,10 @@ Guardian.
   and the model refuses an inferential source that claims certainty.
 - Sensitivity defaults: cycle, pregnancy, health, body signals, purchases and
   money context are `S3`; calendar, people and places are `S2`.
+- Closing a record is two different acts. `superseded()` means it stopped being
+  true and history keeps it; `invalidated()` means it was never true and it is
+  never read back as history. Only `INVALIDATED` is retroactive. Choosing the
+  wrong one corrupts every as-of query.
 
 ## 7. Testing rules
 
@@ -142,6 +163,10 @@ Guardian.
   words "event-driven" and "graph".
 - Returning a bare string from a mind. Outputs are structured.
 - Widening a contract to make a test pass.
+- Putting a price, a time or a recipient in `parameters` instead of
+  `material_terms`. Anything outside `material_terms` is not covered by consent.
+- Handing the execution gate a Guardian assessment of a different action.
+- Editing `docs/domain/agent-authority-matrix.md` by hand.
 
 ## 10. Source-of-truth documents
 
@@ -152,6 +177,9 @@ Guardian.
 | Events | `docs/domain/event-model.md` |
 | Agent contracts | `docs/domain/agent-contracts.md` |
 | Policy | `docs/domain/policy-model.md` |
+| Agent authority | `docs/domain/agent-authority-matrix.md` (generated) |
+| Agent handoffs | `docs/domain/agent-handoffs.md` |
+| Validation | `docs/validation/foundation-validation-01.md` |
 | Decisions | `docs/adr/` |
 
 ## 11. Next phase, when it is authorized

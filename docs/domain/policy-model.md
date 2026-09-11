@@ -51,19 +51,52 @@ ALLOW < CAUTION < ESCALATE < BLOCK
 
 `BLOCK` is a veto. `ESCALATE` stops execution and asks for a human.
 
-## 4. Execution authorization
+## 4. What an authorization is bound to
+
+An authorization answers *what exactly was authorized*, not merely *that
+something was*. It carries:
+
+| Binding | Field |
+| --- | --- |
+| actor | `granted_by` |
+| action | `action_id` |
+| target and material parameters | `authorized_fingerprint` |
+| permission level | `granted_level` |
+| issued at | `granted_at` |
+| validity | `expires_at` |
+| Guardian decision at the time of consent | `guardian_verdict` |
+| user confirmation when required | `method`, `audit_ref` |
+
+`ProposedAction.material_terms` holds the facts consent was given for — a price,
+a time, a recipient — and `terms_fingerprint` is their stable digest, taken
+together with the action, owner, domain, permission level and target. Incidental
+`parameters` such as a retry counter are excluded, so a retry does not revoke
+consent while a repricing does.
+
+Consent to *Pilates Tuesday 19:00 for SAR 100* therefore cannot be spent on
+*Tuesday 20:00 for SAR 180*: the fingerprint differs and the gate answers
+`DENY / MATERIAL_TERMS_CHANGED`. Build one with
+`ExecutionAuthorization.for_action(...)`, which captures the fingerprint from
+the action exactly as it was presented to the user.
+
+## 5. Execution authorization
 
 `ExecutionPolicy.authorize(action, guardian, authorization, at)` evaluates in
 this order:
 
-1. Guardian `BLOCK` → `DENY`. Checked first, so no level and no authorization
-   can buy past it.
-2. Guardian `ESCALATE` → `ESCALATE`.
-3. `A0` → `DENY` with `SUGGESTION_ONLY`.
-4. `A1` → `PERMIT`, recording a Guardian caution if one was raised.
-5. `A2` / `A3` → the authorization is checked: present, for this action, granted
-   by this owner, unexpired, of a sufficient level; `A3` additionally requires an
-   explicit confirmation rather than a standing rule, and an audit reference.
+1. The Guardian assessment must be *about this action*
+   (`subject_action_id == action_id`), otherwise `DENY` with
+   `GUARDIAN_ASSESSMENT_MISSING`. Without this check a `BLOCK` is bypassed by
+   handing the gate an unrelated `ALLOW`.
+2. Guardian `BLOCK` → `DENY`. No level and no authorization buys past it.
+3. Guardian `ESCALATE` → `ESCALATE`.
+4. `A0` → `DENY` with `SUGGESTION_ONLY`.
+5. `A1` → `PERMIT`, recording a Guardian caution if one was raised.
+6. `A2` / `A3` → the authorization is checked: present, for this action, for the
+   same material terms, granted by this owner, captured under a Guardian verdict
+   that permitted execution, unexpired, and of a sufficient level. `A3`
+   additionally requires an explicit confirmation rather than a standing rule,
+   and an audit reference.
 
 `require_execution_authorization(...)` is the gate the Operator calls: it raises
 `AuthorizationRequired` unless the outcome is `PERMIT`.
@@ -72,7 +105,7 @@ Missing or expired authorization yields `REQUIRE_CONFIRMATION` — ask the user.
 A mismatched, insufficient or unaudited authorization yields `DENY` — something
 is wrong, do not ask, refuse.
 
-## 5. Sensitivity
+## 6. Sensitivity
 
 `evaluate_exposure` answers whether a mind may read a record:
 
@@ -91,7 +124,7 @@ user:
 Holding cycle data in a mind's working context and saying it out loud are not the
 same act, and the model keeps them apart.
 
-## 6. Where policies are used
+## 7. Where policies are used
 
 | Policy | Used by |
 | --- | --- |

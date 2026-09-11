@@ -109,6 +109,40 @@ class MemoryInvalidatedPayload(MemoryPayload):
     reason: str
 
 
+class RecommendationPayload(EventPayload):
+    """The raw signal behind behavioural learning.
+
+    Without a record of what was offered and what happened to it, a derived
+    preference has no evidence and cannot be revised against the facts.
+    """
+
+    recommendation_id: str
+    offered_by: AgentName
+    title: str
+    subject_entity_id: EntityId | None = None
+
+
+class PurchaseRecordedPayload(EventPayload):
+    purchase_entity_id: EntityId
+    returnable_until: datetime | None = None
+
+    @field_validator("returnable_until")
+    @classmethod
+    def _utc(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else ensure_utc(value)
+
+
+class ReturnWindowClosingPayload(EventPayload):
+    purchase_entity_id: EntityId
+    returnable_until: datetime
+    days_remaining: int = Field(ge=0)
+
+    @field_validator("returnable_until")
+    @classmethod
+    def _utc(cls, value: datetime) -> datetime:
+        return ensure_utc(value)
+
+
 class PreferenceObservedPayload(EventPayload):
     memory_id: MemoryId
     statement: str
@@ -221,6 +255,12 @@ PAYLOAD_BY_EVENT: dict[EventType, type[EventPayload]] = {
     EventType.MEMORY_CREATED: MemoryPayload,
     EventType.MEMORY_UPDATED: MemoryPayload,
     EventType.MEMORY_INVALIDATED: MemoryInvalidatedPayload,
+    EventType.RECOMMENDATION_SURFACED: RecommendationPayload,
+    EventType.RECOMMENDATION_ACCEPTED: RecommendationPayload,
+    EventType.RECOMMENDATION_DISMISSED: RecommendationPayload,
+    EventType.RECOMMENDATION_IGNORED: RecommendationPayload,
+    EventType.PURCHASE_RECORDED: PurchaseRecordedPayload,
+    EventType.RETURN_WINDOW_CLOSING: ReturnWindowClosingPayload,
     EventType.PREFERENCE_OBSERVED: PreferenceObservedPayload,
     EventType.BEHAVIOR_PATTERN_UPDATED: BehaviorPatternPayload,
     EventType.PRODUCT_ADDED: ProductPayload,

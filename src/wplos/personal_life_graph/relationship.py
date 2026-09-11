@@ -24,6 +24,7 @@ class RelationshipType(StrEnum):
     LOCATED_AT = "LOCATED_AT"
     PREPARES_FOR = "PREPARES_FOR"
     BLOCKS = "BLOCKS"
+    CONFLICTS_WITH = "CONFLICTS_WITH"
     DERIVED_FROM = "DERIVED_FROM"
     WORKS_AS = "WORKS_AS"
     ENROLLED_IN = "ENROLLED_IN"
@@ -100,6 +101,7 @@ RELATIONSHIP_SPECS: dict[RelationshipType, RelationshipSpec] = {
                     EntityType.ROUTINE,
                     EntityType.SKILL,
                     EntityType.TASK,
+                    EntityType.RADAR_ITEM,
                 }
             ),
         ),
@@ -133,6 +135,14 @@ RELATIONSHIP_SPECS: dict[RelationshipType, RelationshipSpec] = {
             relationship_type=RelationshipType.PURCHASED,
             from_types=frozenset({EntityType.PERSON}),
             to_types=frozenset({EntityType.PURCHASE}),
+        ),
+        RelationshipSpec(
+            relationship_type=RelationshipType.CONFLICTS_WITH,
+            from_types=frozenset(
+                {EntityType.CALENDAR_EVENT, EntityType.COMMITMENT, EntityType.TASK}
+            ),
+            to_types=frozenset({EntityType.CALENDAR_EVENT, EntityType.COMMITMENT, EntityType.TASK}),
+            symmetric=True,
         ),
         RelationshipSpec(relationship_type=RelationshipType.OWNS),
         RelationshipSpec(relationship_type=RelationshipType.LOCATED_AT),

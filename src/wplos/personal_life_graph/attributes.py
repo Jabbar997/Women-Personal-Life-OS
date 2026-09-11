@@ -4,6 +4,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from wplos.core.identifiers import EntityId
+from wplos.core.sensitivity import SensitivityLevel
 from wplos.core.temporal import ensure_utc
 from wplos.personal_life_graph.entity_types import EntityType, LifeDomain
 from wplos.shared.errors import InvariantViolation
@@ -18,6 +19,16 @@ class EntityAttributes(BaseModel):
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    def minimum_sensitivity(self) -> SensitivityLevel | None:
+        """The floor this content imposes on its record, if any.
+
+        Record-level sensitivity alone forces a choice between over-classifying
+        a whole record and dropping the one field that is genuinely sensitive.
+        An attributes model that can hold something sharper than its type's
+        default raises the floor instead.
+        """
+        return None
 
 
 class Kinship(StrEnum):
@@ -231,6 +242,7 @@ class WardrobeCategory(StrEnum):
     BAG = "BAG"
     ACCESSORY = "ACCESSORY"
     MODEST_LAYER = "MODEST_LAYER"
+    ACTIVEWEAR = "ACTIVEWEAR"
 
 
 class WardrobeItemAttributes(EntityAttributes):
@@ -277,8 +289,11 @@ class IngredientAttributes(EntityAttributes):
 
 
 class PurchaseAttributes(EntityAttributes):
-    amount_minor: int = Field(ge=0)
+    """A purchase captured in conversation often has no price attached yet;
+    ``None`` says unknown rather than free."""
+
     currency: str = Field(min_length=3, max_length=3)
+    amount_minor: int | None = Field(default=None, ge=0)
     merchant: str | None = None
     returnable_until: datetime | None = None
 
@@ -320,10 +335,20 @@ class InterestAttributes(EntityAttributes):
 
 
 class PlaceAttributes(EntityAttributes):
+    """City and area are what a recommendation needs; a street address is not.
+
+    Holding one raises the record to S3, so a place that can locate the user
+    precisely can never be handed to a mind cleared only for S2.
+    """
+
     city: str | None = None
     area: str | None = None
+    street_address: str | None = None
     is_home: bool = False
     typical_travel_minutes: int | None = Field(default=None, ge=0)
+
+    def minimum_sensitivity(self) -> SensitivityLevel | None:
+        return SensitivityLevel.S3 if self.street_address is not None else None
 
 
 class RadarCategory(StrEnum):

@@ -23,6 +23,16 @@ class ClaimNature(StrEnum):
     OPPORTUNITY = "OPPORTUNITY"
     EXECUTION = "EXECUTION"
 
+    @property
+    def is_exclusive(self) -> bool:
+        """Whether this claim wants the subject to itself.
+
+        Preparing for a commitment is not a rival of that commitment. Treating
+        every claim on a subject as mutually exclusive silently deletes half of
+        a coordinated answer.
+        """
+        return self is not ClaimNature.PREPARATION
+
 
 class Claim(BaseModel):
     """One mind's bid on one contested subject."""
@@ -47,6 +57,15 @@ class ConflictRule(Protocol):
     def name(self) -> str: ...
 
     def arbitrate(self, left: Claim, right: Claim) -> Claim | None: ...
+
+
+class NonContendingRule:
+    """Complementary claims coexist; only rivals go to arbitration."""
+
+    name = "non_contending"
+
+    def applies(self, left: Claim, right: Claim) -> bool:
+        return not (left.nature.is_exclusive and right.nature.is_exclusive)
 
 
 class GuardianVetoRule:
@@ -155,6 +174,7 @@ class ConflictResolutionPolicy:
     name = "orchestration.conflict"
 
     def __init__(self, rules: tuple[ConflictRule, ...] | None = None) -> None:
+        self.coexistence = NonContendingRule()
         self.rules: tuple[ConflictRule, ...] = rules or (
             GuardianVetoRule(),
             SafetyPriorityRule(),
@@ -166,12 +186,23 @@ class ConflictResolutionPolicy:
 
     def arbitrate(self, left: Claim, right: Claim) -> tuple[Claim, Claim, str] | None:
         """Return (winner, loser, rule) or None when both may stand."""
+        if self.coexistence.applies(left, right) and not self._vetoed(left, right):
+            return None
         for rule in self.rules:
             winner = rule.arbitrate(left, right)
             if winner is not None:
                 loser = right if winner is left else left
                 return winner, loser, rule.name
         return None
+
+    def _vetoed(self, left: Claim, right: Claim) -> bool:
+        """A Guardian veto still reaches a claim that contends with nothing."""
+        return any(
+            claim.agent is AgentName.GUARDIAN
+            and claim.guardian_verdict is not None
+            and not claim.guardian_verdict.permits_execution
+            for claim in (left, right)
+        )
 
     def resolve(self, claims: tuple[Claim, ...]) -> ConflictResolution:
         surviving: list[Claim] = []

@@ -35,7 +35,11 @@ OPERATOR_CONTRACT = AgentContract(
     max_permission_level=PermissionLevel.A3,
     max_sensitivity=SensitivityLevel.S3,
     events_consumed=frozenset(
-        {EventType.GUARDIAN_BLOCKED_ACTION, EventType.GUARDIAN_CAUTION_RAISED}
+        {
+            EventType.GUARDIAN_BLOCKED_ACTION,
+            EventType.GUARDIAN_CAUTION_RAISED,
+            EventType.OPERATOR_ACTION_AUTHORIZED,
+        }
     ),
     events_produced=frozenset(
         {

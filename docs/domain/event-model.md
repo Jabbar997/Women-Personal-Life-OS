@@ -50,8 +50,20 @@ created/updated events, `OpenLoopPayload` for tasks and commitments,
 ## 4. Catalog
 
 Profile · Goals · Commitments · Tasks · Deadlines · Calendar events · Calendar
-conflict · Capture · Memory · Preference and behaviour · Products · Wardrobe ·
-Cycle · Mood, energy, sleep · Weather · Radar · Guardian · Readiness · Operator.
+conflict · Capture · Memory · Recommendations · Preference and behaviour ·
+Purchases and return windows · Products · Wardrobe · Cycle · Mood, energy,
+sleep · Weather · Radar · Guardian · Readiness · Operator.
+
+The recommendation lifecycle exists because behavioural learning needs the raw
+signal:
+
+```
+RECOMMENDATION_SURFACED
+RECOMMENDATION_ACCEPTED | RECOMMENDATION_DISMISSED | RECOMMENDATION_IGNORED
+```
+
+Without a record of what was offered and what became of it, a derived
+preference has no evidence behind it and cannot be revised against the facts.
 
 The Operator's lifecycle is explicit because authorization has to be auditable:
 

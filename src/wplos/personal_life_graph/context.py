@@ -120,13 +120,18 @@ def project_context(
         if admit(RedactionScope.ENTITY, entity.sensitivity, scope.requires(entity.entity_type))
     )
 
-    admitted_ids = {entity.id for entity in entities}
+    admitted = {entity.id: entity for entity in entities}
     relationships = tuple(
         relationship
         for relationship in graph.relationships(owner_id=owner_id, at=at)
-        if relationship.from_entity_id in admitted_ids
-        and relationship.to_entity_id in admitted_ids
-        and admit(RedactionScope.RELATIONSHIP, relationship.sensitivity, True)
+        if relationship.from_entity_id in admitted
+        and relationship.to_entity_id in admitted
+        and admit(
+            RedactionScope.RELATIONSHIP,
+            relationship.sensitivity,
+            scope.requires(admitted[relationship.from_entity_id].entity_type)
+            and scope.requires(admitted[relationship.to_entity_id].entity_type),
+        )
     )
 
     memory_candidates = graph.memories(

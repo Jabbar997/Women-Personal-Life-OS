@@ -80,14 +80,25 @@ class MemoryRecord(ProvenancedRecord):
             }
         )
 
+    def superseded(self, *, at: datetime, reason: str) -> "MemoryRecord":
+        """The memory was true and has stopped being true.
+
+        History keeps it: an as-of query before ``at`` still sees it.
+        """
+        return self._closed(at=at, reason=reason, status=RecordStatus.SUPERSEDED)
+
     def invalidated(self, *, at: datetime, reason: str) -> "MemoryRecord":
-        """Memory is never erased; it is closed in time with a reason."""
+        """The memory was wrong. It is retained for audit but never read back
+        as something that was once true."""
+        return self._closed(at=at, reason=reason, status=RecordStatus.INVALIDATED)
+
+    def _closed(self, *, at: datetime, reason: str, status: RecordStatus) -> "MemoryRecord":
         return self.model_copy(
             update={
                 "temporal": self.temporal.closed_at(at),
-                "status": RecordStatus.INVALIDATED,
+                "status": status,
                 "updated_at": at,
-                "metadata": {**self.metadata, "invalidation_reason": reason},
+                "metadata": {**self.metadata, "closure_reason": reason},
             }
         )
 

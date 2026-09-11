@@ -52,6 +52,16 @@ class Entity(ProvenancedRecord):
             )
         return self
 
+    @model_validator(mode="after")
+    def _sensitivity_covers_its_content(self) -> Self:
+        floor = self.attributes.minimum_sensitivity()
+        if floor is not None and not self.attribution.sensitivity.dominates(floor):
+            raise ValueError(
+                f"{self.entity_type} carrying this content requires at least {floor}, "
+                f"got {self.attribution.sensitivity}"
+            )
+        return self
+
     @classmethod
     def create(
         cls,

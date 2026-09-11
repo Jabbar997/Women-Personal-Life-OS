@@ -156,7 +156,12 @@ class PersonalLifeGraph:
             raise RecordNotFound(f"memory {memory_id} is not in the graph")
         return memory
 
+    def supersede_memory(self, memory_id: MemoryId, *, at: datetime, reason: str) -> MemoryRecord:
+        """The memory stopped being true. History before ``at`` is unaffected."""
+        return self.put_memory(self.get_memory(memory_id).superseded(at=at, reason=reason))
+
     def invalidate_memory(self, memory_id: MemoryId, *, at: datetime, reason: str) -> MemoryRecord:
+        """The memory was wrong. It is retained but never read back as history."""
         return self.put_memory(self.get_memory(memory_id).invalidated(at=at, reason=reason))
 
     def memories(

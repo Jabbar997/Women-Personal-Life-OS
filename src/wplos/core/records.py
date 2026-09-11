@@ -12,13 +12,22 @@ from wplos.shared.json import JsonValue
 
 
 class RecordStatus(StrEnum):
-    """Lifecycle of a stored record. Nothing is ever hard-deleted."""
+    """Lifecycle of a stored record. Nothing is ever hard-deleted.
+
+    ``INVALIDATED`` alone is retroactive: it means the record was never true and
+    must not be read back as history. A superseded or expired record was true
+    once, and an as-of query must still be able to see it.
+    """
 
     ACTIVE = "ACTIVE"
     SUPERSEDED = "SUPERSEDED"
     INVALIDATED = "INVALIDATED"
     EXPIRED = "EXPIRED"
     ARCHIVED = "ARCHIVED"
+
+    @property
+    def negates_history(self) -> bool:
+        return self is RecordStatus.INVALIDATED
 
 
 class ProvenancedRecord(BaseModel):
@@ -51,4 +60,10 @@ class ProvenancedRecord(BaseModel):
         return self.attribution.sensitivity
 
     def is_active_at(self, at: datetime) -> bool:
-        return self.status is RecordStatus.ACTIVE and self.temporal.is_valid_at(at)
+        """Was this record in force at that instant?
+
+        Asking about the past must not depend on the record's status today,
+        otherwise closing a record quietly rewrites what the graph says about
+        last week.
+        """
+        return not self.status.negates_history and self.temporal.is_valid_at(at)

@@ -159,5 +159,20 @@ GuardianVetoRule · SafetyPriorityRule · CommitmentOverOpportunityRule ·
 NaturePrecedenceRule · PriorityClassRule · ConfidenceRule
 ```
 
-Claims on different subjects coexist. A suppressed claim records what it lost to
-and which rule decided.
+Claims on different subjects coexist, and so do claims that do not actually
+contend: `ClaimNature.PREPARATION` is not exclusive, because preparing for a
+commitment is not a rival of that commitment. Arbitration runs only between
+claims that want the same subject to themselves, so a coordinated answer keeps
+its preparation advice instead of losing it to the commitment it serves. A
+Guardian veto still reaches a non-contending claim.
+
+A suppressed claim records what it lost to and which rule decided.
+
+## 13. Authority and handoffs
+
+The full read/write/propose/veto/execute matrix is generated from these
+contracts into [`agent-authority-matrix.md`](agent-authority-matrix.md), and the
+permitted passes of work between minds are in
+[`agent-handoffs.md`](agent-handoffs.md). Both are checked against the code by
+`tests/test_agent_authority.py`; a handoff that claims to carry an event its
+endpoints cannot exchange fails the build.

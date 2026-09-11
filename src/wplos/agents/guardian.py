@@ -47,6 +47,7 @@ GUARDIAN_CONTRACT = AgentContract(
             EventType.RADAR_ITEM_DISCOVERED,
             EventType.CALENDAR_CONFLICT_DETECTED,
             EventType.CYCLE_STATE_CHANGED,
+            EventType.READINESS_PLAN_CREATED,
         }
     ),
     events_produced=frozenset(

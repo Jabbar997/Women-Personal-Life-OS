@@ -44,6 +44,8 @@ LIFE_ADMIN_CONTRACT = AgentContract(
         {
             EventType.CAPTURE_PARSED,
             EventType.CAPTURE_ROUTED,
+            EventType.GOAL_UPDATED,
+            EventType.GOAL_PROGRESS_UPDATED,
             EventType.EVENT_CREATED,
             EventType.EVENT_CANCELLED,
             EventType.PRODUCT_LOW,

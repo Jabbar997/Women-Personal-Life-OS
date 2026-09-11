@@ -80,6 +80,9 @@ test suite. All four must pass before anything is pushed.
 | [`docs/domain/event-model.md`](docs/domain/event-model.md) | Envelope, catalog, bus, event rules. |
 | [`docs/domain/agent-contracts.md`](docs/domain/agent-contracts.md) | What each mind may read, write, decide and never do. |
 | [`docs/domain/policy-model.md`](docs/domain/policy-model.md) | Permission levels, Guardian verdicts, sensitivity and execution policy. |
+| [`docs/domain/agent-authority-matrix.md`](docs/domain/agent-authority-matrix.md) | Who may read, write, propose, veto and execute. Generated from the contracts. |
+| [`docs/domain/agent-handoffs.md`](docs/domain/agent-handoffs.md) | The permitted passes of work between minds. |
+| [`docs/validation/foundation-validation-01.md`](docs/validation/foundation-validation-01.md) | The ten-scenario life simulation and what it broke. |
 | [`docs/adr/`](docs/adr/) | Architecture decision records. |
 
 ## Licence

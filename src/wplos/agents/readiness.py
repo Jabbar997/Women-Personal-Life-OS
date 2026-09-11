@@ -55,6 +55,8 @@ READINESS_CONTRACT = AgentContract(
         {
             EventType.EVENT_CREATED,
             EventType.EVENT_UPDATED,
+            EventType.COMMITMENT_CAPTURED,
+            EventType.DEADLINE_APPROACHING,
             EventType.WEATHER_CONTEXT_CHANGED,
             EventType.CYCLE_STATE_CHANGED,
             EventType.ENERGY_UPDATED,
