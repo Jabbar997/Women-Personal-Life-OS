@@ -168,18 +168,52 @@ exclusions: it sets `temporal.valid_until`, so it decides what the graph says
 about last Tuesday, and closing at a different time is a different closure.
 `ResolvedGraphWrite.logical_terms` is the list, with the reasoning.
 
-The service looks the key up before validating, so a retried `CREATE` is not
-refused for having already succeeded. That look-up is a fast path, not the
-protection: two retries arriving together both find nothing and both reach the
-insert, where the constraint decides.
+### Both identities resolve before anything is checked against the graph
 
-A retry can also lose the race *after* its look-up: it finds nothing, the winner
-commits, and validation then fails against the state the winner left — the
-entity already exists, or the revision has moved on. Before returning that
-failure the service re-reads the durable record, and if this exact request has
-meanwhile been answered it returns that answer. The re-read is narrow: it only
-ever converts a failure into the receipt the database actually holds, so a
-genuinely stale write under its own key still raises `ConcurrentModification`.
+`_resolve_existing_request` reads **both** names — the key and the request id —
+before validation begins. This is not an optimisation. A retry that reaches
+validation is validated against the state its own first attempt produced, and
+then refused for it:
+
+```
+CREATE retry  -> "entity already exists"
+REVISE retry  -> ConcurrentModification
+CLOSE  retry  -> "already ARCHIVED"
+```
+
+All three are the first attempt having succeeded, reported as failure. Resolving
+the request first is what makes a retry under a new key return the original
+receipt instead.
+
+It answers one of four things, in the project's own vocabulary:
+
+| | |
+| --- | --- |
+| nothing found | validate and commit as normal |
+| `DUPLICATE` | the same work under one of its names; the original receipt |
+| `CONFLICT` | that name already stands for different work — or for someone else's |
+| `RequestIdentityConflict` | the two names disagree about which request this is |
+
+The last one **fails closed**. If the key names one stored request and the run
+id names another, answering with either could hand the caller a receipt for work
+it did not ask for, so the service raises rather than picking.
+
+A request id is unique across the whole store rather than per owner, so the
+owner is checked before any receipt is returned: guessing an id must never be a
+way to read what somebody else's run did. An owner mismatch is answered exactly
+as a fingerprint mismatch is, and says no more than that.
+
+The look-up is still not the protection. Two retries arriving together both find
+nothing and both reach the insert, where the uniqueness constraints decide.
+
+### A retry can also lose the race after its look-up
+
+It finds nothing, the winner commits, and validation then fails against the
+state the winner left. Before returning that failure the service resolves the
+request again — by both names — and if this exact request has meanwhile been
+answered it returns that answer. The re-read is narrow: it only ever converts a
+failure into a receipt the database actually holds, so a genuinely stale write,
+under its own key and its own request id, still raises `ConcurrentModification`.
 See ADR-013.
 
 ## Batch semantics

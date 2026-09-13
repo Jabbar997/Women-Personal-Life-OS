@@ -62,19 +62,32 @@ unique constraint. Graph writes needed the same answer, not a different one.
    silently rewrite history the first attempt had already written. It is
    normalised to UTC before hashing, so the same instant expressed in another
    zone is still the same closure.
-8. The service reads the stored receipt before validating, but that is a fast
-   path and not the protection. It exists so a retried `CREATE` is not refused
-   for having already succeeded. Two retries arriving together both see nothing
-   there and both reach `commit`, where the unique constraint decides which one
-   happened.
-9. **A retry can lose the race after its look-up.** It finds nothing, the winner
-   commits, and validation then fails against the state the winner left — the
-   entity already exists, or the revision has moved on. Before returning that
-   failure the service re-reads the durable record and returns the answer this
-   exact request has meanwhile been given. The re-read is deliberately narrow:
-   it can only ever produce the receipt the database actually holds, so a
-   genuinely stale write under its own key still raises.
-10. A stale revision is otherwise not one of these outcomes. It is an invariant
+8. **Both identities are resolved before anything is checked against graph
+   state**, and neither is left to be discovered inside `commit`. A retry that
+   reaches validation is validated against the state its own first attempt
+   produced and then refused for it — "entity already exists", a stale
+   revision, "already ARCHIVED" — which is success reported as failure. The
+   resolver answers one of four things: nothing found, `DUPLICATE`, `CONFLICT`,
+   or `RequestIdentityConflict`. Reading both names is a correctness path; the
+   uniqueness constraints remain the protection, and two retries arriving
+   together still both reach `commit`, where the database decides.
+9. **If the two identities disagree, it fails closed.** A key naming one stored
+   request while the run id names another cannot be resolved by picking one:
+   either answer risks handing the caller a receipt for work it never asked for.
+10. **A request id is checked against its owner before any receipt is
+    returned.** The id is unique across the store rather than per owner, so
+    guessing one must not become a way to read what somebody else's run did. An
+    owner mismatch is answered exactly as a fingerprint mismatch is, and says no
+    more than that. The fingerprint already includes the owner, so today the two
+    guards agree; the check stands on its own so that it keeps holding if the
+    fingerprint's contents ever change.
+11. **A retry can lose the race after its look-up.** It finds nothing, the winner
+    commits, and validation then fails against the state the winner left. Before
+    returning that failure the service resolves the request again, by both
+    names, and returns the answer it has meanwhile been given. The re-read is
+    deliberately narrow: it can only ever produce a receipt the database
+    actually holds, so a genuinely stale write under its own names still raises.
+12. A stale revision is otherwise not one of these outcomes. It is an invariant
     of the graph, and it raises `ConcurrentModification` — the same exception the
     in-memory graph has raised since Phase 01. Every write against an existing
     record names the version it saw, `CLOSE` included: a close prepared against

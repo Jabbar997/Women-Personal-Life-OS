@@ -161,11 +161,15 @@ class SQLiteGraphStore:
     def receipt_for(self, *, owner_id: UserId, idempotency_key: str) -> StoredReceipt | None:
         with connect(self.path) as connection:
             row = connection.execute(
-                """
-                SELECT fingerprint, receipt_json FROM graph_write_requests
-                WHERE owner_id=? AND idempotency_key=?
-                """,
+                "SELECT * FROM graph_write_requests WHERE owner_id=? AND idempotency_key=?",
                 (str(owner_id), idempotency_key),
+            ).fetchone()
+        return None if row is None else _stored_receipt(row)
+
+    def receipt_for_request(self, request_id: RequestId) -> StoredReceipt | None:
+        with connect(self.path) as connection:
+            row = connection.execute(
+                "SELECT * FROM graph_write_requests WHERE request_id=?", (str(request_id),)
             ).fetchone()
         return None if row is None else _stored_receipt(row)
 
@@ -259,10 +263,7 @@ class SQLiteGraphStore:
         self, connection: sqlite3.Connection, batch: GraphWriteBatch
     ) -> GraphWriteReceipt:
         by_key = connection.execute(
-            """
-            SELECT fingerprint, receipt_json FROM graph_write_requests
-            WHERE owner_id=? AND idempotency_key=?
-            """,
+            "SELECT * FROM graph_write_requests WHERE owner_id=? AND idempotency_key=?",
             (str(batch.owner_id), batch.idempotency_key),
         ).fetchone()
         if by_key is not None:
@@ -272,9 +273,7 @@ class SQLiteGraphStore:
                 clash=f"idempotency key {batch.idempotency_key}",
             )
         by_run = connection.execute(
-            """
-            SELECT fingerprint, receipt_json FROM graph_write_requests WHERE request_id=?
-            """,
+            "SELECT * FROM graph_write_requests WHERE request_id=?",
             (str(batch.run.request_id),),
         ).fetchone()
         if by_run is None:
@@ -285,7 +284,10 @@ class SQLiteGraphStore:
         self, stored: StoredReceipt, batch: GraphWriteBatch, *, clash: str
     ) -> GraphWriteReceipt:
         """The same work is the same answer; different work under one name is not."""
-        if stored.fingerprint != batch.fingerprint:
+        if stored.owner_id != batch.owner_id or stored.fingerprint != batch.fingerprint:
+            # An owner mismatch answers the same way and says no more than that.
+            # Whose the request is, and what it did, are not this caller's to
+            # learn from a receipt they asked for by guessing an id.
             return GraphWriteReceipt(
                 outcome=GraphWriteOutcome.CONFLICT,
                 request_id=batch.run.request_id,
@@ -450,6 +452,9 @@ def _entity(row: sqlite3.Row) -> Entity:
 
 def _stored_receipt(row: sqlite3.Row) -> StoredReceipt:
     return StoredReceipt(
+        owner_id=UserId(str(row["owner_id"])),
+        idempotency_key=str(row["idempotency_key"]),
+        request_id=RequestId(str(row["request_id"])),
         fingerprint=str(row["fingerprint"]),
         receipt=GraphWriteReceipt.model_validate_json(str(row["receipt_json"])),
     )

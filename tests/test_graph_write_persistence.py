@@ -22,6 +22,7 @@ from wplos.application.agent_port import AgentInvocation
 from wplos.application.enforcement import ContractViolation
 from wplos.application.graph_events import resolve_graph_event
 from wplos.application.graph_write import (
+    AppliedWrite,
     GraphCommit,
     GraphWriteBatch,
     GraphWriteOutcome,
@@ -29,8 +30,9 @@ from wplos.application.graph_write import (
     ResolvedGraphWrite,
     RuntimeRunRecord,
     StoredReceipt,
+    batch_fingerprint,
 )
-from wplos.application.graph_write_service import GraphWriteService
+from wplos.application.graph_write_service import GraphWriteService, RequestIdentityConflict
 from wplos.application.request import RuntimeRequest
 from wplos.application.result import RuntimeStatus
 from wplos.application.writes import SanctionedWrite
@@ -39,6 +41,7 @@ from wplos.core.confidence import Confidence
 from wplos.core.identifiers import (
     CorrelationId,
     EntityId,
+    EventId,
     RequestId,
     UserId,
     new_correlation_id,
@@ -1137,22 +1140,32 @@ def test_an_unknown_entity_reads_back_as_absent_rather_than_as_an_empty_record(s
 
 
 class RacingGraphStore(SQLiteGraphStore):
-    """A store that lets another caller commit inside this one's idempotency look-up.
+    """A store that lets another caller commit inside this one's look-ups.
 
-    The interleaving that matters is: A looks up the key and finds nothing, B
-    commits the identical request, A then validates against the state B left.
-    The hook fires on the first miss and A still receives the answer its look-up
-    actually saw, which is what makes the race deterministic without a sleep.
+    The interleaving that matters is: A resolves both identities and finds
+    nothing, B commits the identical request, A then validates against the state
+    B left. A hook fires on the first miss and A still receives the answer its
+    look-up actually saw, which is what makes the race deterministic without a
+    sleep. There is one hook per identity, so a test can choose which look-up
+    the winner slips past.
     """
 
     def __init__(self, path: Path) -> None:
         super().__init__(path)
         self.on_first_miss: Callable[[], None] | None = None
+        self.on_first_request_miss: Callable[[], None] | None = None
 
     def receipt_for(self, *, owner_id: UserId, idempotency_key: str) -> StoredReceipt | None:
         found = super().receipt_for(owner_id=owner_id, idempotency_key=idempotency_key)
         if found is None and self.on_first_miss is not None:
             hook, self.on_first_miss = self.on_first_miss, None
+            hook()
+        return found
+
+    def receipt_for_request(self, request_id: RequestId) -> StoredReceipt | None:
+        found = super().receipt_for_request(request_id)
+        if found is None and self.on_first_request_miss is not None:
+            hook, self.on_first_request_miss = self.on_first_request_miss, None
             hook()
         return found
 
@@ -1516,3 +1529,305 @@ def test_a_rejected_predecessor_leaves_no_event_behind(store):
         )
 
     assert store.count_events() == 1
+
+
+# --- review round 2: R01, both retry identities resolve before validation ----
+
+
+def _apply_with(
+    service: GraphWriteService,
+    write: ResolvedGraphWrite,
+    *,
+    key: str,
+    request_id: RequestId,
+    owner: UserId = OWNER,
+    correlation_id: CorrelationId | None = None,
+) -> GraphWriteReceipt:
+    return service.apply(
+        (write,),
+        owner_id=owner,
+        request_id=request_id,
+        correlation_id=correlation_id or new_correlation_id(),
+        idempotency_key=key,
+        now=NOW,
+    )
+
+
+def _prepared(operation: str, service: GraphWriteService, store: SQLiteGraphStore) -> Entity:
+    """The version a write of ``operation`` is built against, before it is applied."""
+    entity = commitment()
+    if operation == "create":
+        return entity
+    _apply_with(service, create_write(entity), key="k-setup", request_id=new_request_id())
+    return store.current_entity(entity.id)
+
+
+def _write_for(operation: str, before: Entity) -> ResolvedGraphWrite:
+    """The same concrete write, rebuilt from the same inputs the first attempt had.
+
+    A retry does not get to see what its own first attempt did. It rebuilds the
+    command from what it held when it started — the version it read, the closure
+    time it chose — which is exactly why the fingerprint has to come out the
+    same both times.
+    """
+    match operation:
+        case "create":
+            return create_write(before)
+        case "revise":
+            return revise_write(before, label="the shop moved")
+        case _:
+            return close_write(before, at=LATER)
+
+
+@pytest.mark.parametrize("operation", ["create", "revise", "close"])
+def test_request_retry_with_new_key_returns_original(operation, db):
+    """R01 — a retry recovering an answer under a new key must not be validated
+    against the state its own first attempt produced."""
+    store = SQLiteGraphStore(db)
+    service = GraphWriteService(store=store)
+    request_id = new_request_id()
+    before = _prepared(operation, service, store)
+
+    first = _apply_with(service, _write_for(operation, before), key="K1", request_id=request_id)
+    versions = len(store.entity_versions(before.id))
+    events = store.count_events()
+    run = store.run_record(request_id)
+
+    del service, store
+    reopened = SQLiteGraphStore(db)
+    retried = _apply_with(
+        GraphWriteService(store=reopened),
+        _write_for(operation, before),
+        key="K2",
+        request_id=request_id,
+    )
+
+    assert first.outcome is GraphWriteOutcome.APPLIED
+    assert retried.outcome is GraphWriteOutcome.DUPLICATE
+    assert retried.writes == first.writes
+    assert len(reopened.entity_versions(before.id)) == versions
+    assert reopened.count_events() == events
+    assert reopened.run_record(request_id) == run
+
+
+def test_request_retry_with_new_key_does_not_reject_a_created_entity(db):
+    """1 — CREATE, with the same entity id rather than a freshly minted one."""
+    store = SQLiteGraphStore(db)
+    service = GraphWriteService(store=store)
+    request_id = new_request_id()
+    entity = commitment()
+
+    first = _apply_with(service, create_write(entity), key="K1", request_id=request_id)
+
+    reopened = SQLiteGraphStore(db)
+    retried = _apply_with(
+        GraphWriteService(store=reopened),
+        create_write(entity),
+        key="K2",
+        request_id=request_id,
+    )
+
+    assert retried.outcome is GraphWriteOutcome.DUPLICATE
+    assert retried.writes == first.writes
+    assert reopened.count_entity_versions() == 1
+    assert reopened.count_events() == 1
+
+
+def test_request_retry_with_new_key_does_not_raise_on_a_revision(db):
+    """2 — REVISE. The predecessor has moved on precisely because this request
+    already succeeded, so ConcurrentModification would be a lie."""
+    store = SQLiteGraphStore(db)
+    service = GraphWriteService(store=store)
+    entity = commitment()
+    _apply_with(service, create_write(entity), key="k-setup", request_id=new_request_id())
+    request_id = new_request_id()
+    write = revise_write(store.current_entity(entity.id), label="the shop moved")
+
+    first = _apply_with(service, write, key="K1", request_id=request_id)
+
+    reopened = SQLiteGraphStore(db)
+    retried = _apply_with(GraphWriteService(store=reopened), write, key="K2", request_id=request_id)
+
+    assert retried.outcome is GraphWriteOutcome.DUPLICATE
+    assert retried.writes == first.writes
+    assert [item.revision for item in reopened.entity_versions(entity.id)] == [1, 2]
+    assert reopened.count_events() == 2
+
+
+def test_request_retry_with_new_key_does_not_reject_an_already_closed_record(db):
+    """3 — CLOSE. "Already ARCHIVED" is this request's own work, not a refusal."""
+    store = SQLiteGraphStore(db)
+    service = GraphWriteService(store=store)
+    entity = commitment()
+    _apply_with(service, create_write(entity), key="k-setup", request_id=new_request_id())
+    request_id = new_request_id()
+    write = close_write(store.current_entity(entity.id), at=LATER)
+
+    first = _apply_with(service, write, key="K1", request_id=request_id)
+
+    reopened = SQLiteGraphStore(db)
+    retried = _apply_with(GraphWriteService(store=reopened), write, key="K2", request_id=request_id)
+
+    assert retried.outcome is GraphWriteOutcome.DUPLICATE
+    assert retried.writes == first.writes
+    assert [item.revision for item in reopened.entity_versions(entity.id)] == [1, 2]
+    assert reopened.count_events() == 2
+    assert reopened.current_entity(entity.id).temporal.valid_until == LATER
+
+
+def test_a_request_id_carrying_different_work_under_a_new_key_conflicts(service, store):
+    """4 — the recovery path answers the same question B07 does, and answers it
+    before validation rather than inside commit."""
+    request_id = new_request_id()
+    kept = commitment(label="Return the dress")
+
+    first = _apply_with(service, create_write(kept), key="K1", request_id=request_id)
+    other = _apply_with(
+        service,
+        create_write(commitment(label="Cancel the gym")),
+        key="K2",
+        request_id=request_id,
+    )
+
+    assert first.outcome is GraphWriteOutcome.APPLIED
+    assert other.outcome is GraphWriteOutcome.CONFLICT
+    assert other.writes == ()
+    assert store.count_entity_versions() == 1
+    assert store.count_events() == 1
+    assert store.run_record(request_id).entity_ids == (kept.id,)
+
+
+def test_request_id_retry_recovers_after_a_lookup_race(db):
+    """5 — the winner commits between this caller's look-ups and its validation,
+    and the recovery comes back through the request id rather than the key."""
+    racing = RacingGraphStore(db)
+    late = GraphWriteService(store=racing)
+    winner = GraphWriteService(store=SQLiteGraphStore(db))
+    request_id = new_request_id()
+    write = create_write(commitment())
+    won: list[GraphWriteReceipt] = []
+    racing.on_first_request_miss = lambda: won.append(
+        _apply_with(winner, write, key="K1", request_id=request_id)
+    )
+
+    answer = _apply_with(late, write, key="K2", request_id=request_id)
+
+    assert won[0].outcome is GraphWriteOutcome.APPLIED
+    assert answer.outcome is GraphWriteOutcome.DUPLICATE
+    assert answer.writes == won[0].writes
+    assert racing.count_entity_versions() == 1
+    assert racing.count_events() == 1
+
+
+def test_a_genuinely_stale_write_under_a_fresh_request_still_raises(db):
+    """6 — recovery answers a retry, never an unrelated loser."""
+    service = GraphWriteService(store=SQLiteGraphStore(db))
+    entity = commitment()
+    _apply_with(service, create_write(entity), key="k-setup", request_id=new_request_id())
+    read_by_both = SQLiteGraphStore(db).current_entity(entity.id)
+    _apply_with(
+        service,
+        revise_write(read_by_both, label="from the phone"),
+        key="k-a",
+        request_id=new_request_id(),
+    )
+
+    with pytest.raises(ConcurrentModification):
+        _apply_with(
+            service,
+            revise_write(read_by_both, label="from the laptop"),
+            key="k-b",
+            request_id=new_request_id(),
+        )
+
+
+def test_a_request_id_cannot_recover_another_owners_receipt(db):
+    """7 — a request id is unique across the store, so guessing one must not be
+    a way to read what somebody else's run did."""
+    store = SQLiteGraphStore(db)
+    hers = GraphWriteService(store=store)
+    request_id = new_request_id()
+    entity = commitment()
+    mine = _apply_with(hers, create_write(entity), key="K1", request_id=request_id)
+
+    theirs = _apply_with(
+        GraphWriteService(store=store),
+        create_write(commitment(owner=STRANGER), owner=STRANGER),
+        key="K2",
+        request_id=request_id,
+        owner=STRANGER,
+    )
+
+    assert mine.outcome is GraphWriteOutcome.APPLIED
+    assert theirs.outcome is GraphWriteOutcome.CONFLICT
+    assert theirs.writes == ()
+    assert str(entity.id) not in (theirs.detail or "")
+    assert store.count_entity_versions() == 1
+    assert store.count_events() == 1
+
+
+class ForeignRequestStore(SQLiteGraphStore):
+    """A store whose request-id look-up answers with somebody else's request."""
+
+    def __init__(self, path: Path, foreign: StoredReceipt) -> None:
+        super().__init__(path)
+        self.foreign = foreign
+
+    def receipt_for_request(self, request_id: RequestId) -> StoredReceipt | None:
+        return self.foreign
+
+
+def test_the_owner_check_stands_on_its_own_even_when_the_fingerprints_agree(db):
+    """The owner guard is not carried by the fingerprint happening to include the
+    owner. Given a stored request that matches on fingerprint and differs only in
+    who owns it, the receipt still must not come back."""
+    write = create_write(commitment())
+    fingerprint = batch_fingerprint(OWNER, (write,))
+    foreign = StoredReceipt(
+        owner_id=STRANGER,
+        idempotency_key="hers",
+        request_id=new_request_id(),
+        fingerprint=fingerprint,
+        receipt=GraphWriteReceipt(
+            outcome=GraphWriteOutcome.APPLIED,
+            request_id=new_request_id(),
+            correlation_id=new_correlation_id(),
+            idempotency_key="hers",
+            writes=(
+                AppliedWrite(
+                    entity_id=EntityId("ent_hers"),
+                    entity_type=EntityType.COMMITMENT,
+                    operation=WriteOperation.CREATE,
+                    revision=1,
+                    event_id=EventId("evt_hers"),
+                    event_type=EventType.COMMITMENT_CAPTURED,
+                ),
+            ),
+        ),
+    )
+    store = ForeignRequestStore(db, foreign)
+
+    answer = _apply_with(
+        GraphWriteService(store=store), write, key="mine", request_id=new_request_id()
+    )
+
+    assert answer.outcome is GraphWriteOutcome.CONFLICT
+    assert answer.writes == ()
+    assert "ent_hers" not in (answer.detail or "")
+    assert store.count_entity_versions() == 0
+
+
+def test_two_identities_naming_two_different_requests_fail_closed(service, store):
+    """The consistency rule. If the key says one stored request and the run id
+    says another, there is nothing safe to return."""
+    first_request = new_request_id()
+    second_request = new_request_id()
+    write = create_write(commitment())
+    _apply_with(service, write, key="K1", request_id=first_request)
+    _apply_with(service, create_write(commitment()), key="K2", request_id=second_request)
+
+    with pytest.raises(RequestIdentityConflict):
+        _apply_with(service, write, key="K1", request_id=second_request)
+
+    assert store.count_entity_versions() == 2
+    assert store.count_events() == 2

@@ -35,6 +35,15 @@ from wplos.personal_life_graph.entity import Entity
 from wplos.shared.errors import ConcurrentModification, DomainError
 
 
+class RequestIdentityConflict(DomainError):
+    """A request's two durable identities point at two different requests.
+
+    The idempotency key says this is one stored request and the run id says it
+    is another. There is no safe way to pick: answering with either could hand
+    the caller a receipt for work it did not ask for. It fails closed.
+    """
+
+
 class UnresolvableWrite(DomainError):
     """An intent could not be turned into a concrete typed mutation.
 
@@ -99,7 +108,7 @@ class GraphWriteService:
     ) -> GraphWriteReceipt:
         """Validate and durably apply a whole batch, or none of it."""
         fingerprint = batch_fingerprint(owner_id, writes)
-        settled = self._already_answered(
+        settled = self._resolve_existing_request(
             owner_id=owner_id,
             idempotency_key=idempotency_key,
             fingerprint=fingerprint,
@@ -113,7 +122,7 @@ class GraphWriteService:
                 writes, owner_id=owner_id, correlation_id=correlation_id, at=now
             )
         except _Rejected as rejected:
-            raced = self._already_answered(
+            raced = self._resolve_existing_request(
                 owner_id=owner_id,
                 idempotency_key=idempotency_key,
                 fingerprint=fingerprint,
@@ -130,7 +139,7 @@ class GraphWriteService:
                 detail=rejected.detail,
             )
         except ConcurrentModification:
-            raced = self._already_answered(
+            raced = self._resolve_existing_request(
                 owner_id=owner_id,
                 idempotency_key=idempotency_key,
                 fingerprint=fingerprint,
@@ -200,7 +209,7 @@ class GraphWriteService:
 
     # --- validation ---------------------------------------------------------
 
-    def _already_answered(
+    def _resolve_existing_request(
         self,
         *,
         owner_id: UserId,
@@ -209,29 +218,59 @@ class GraphWriteService:
         request_id: RequestId,
         correlation_id: CorrelationId,
     ) -> GraphWriteReceipt | None:
-        """The answer this key was already given, if it was given one.
+        """The answer this request was already given, by either of its identities.
 
-        This runs before validation because a retry must not be re-validated
-        against the state its own first attempt produced: a ``CREATE`` sent
-        twice would otherwise be refused the second time for having succeeded
-        the first.
+        A request is durable under two names — ``(owner_id, idempotency_key)``
+        and ``request_id`` — and both have to be resolved *before* anything is
+        checked against graph state. A retry that reaches validation is
+        validated against the state its own first attempt produced, and then
+        refused for it: the entity already exists, the revision has moved on,
+        the record is already closed. All three are the first attempt having
+        succeeded, reported as failure.
 
-        It is a fast path, not the protection. Two retries arriving together
-        both see nothing here and both go on to ``commit``, where the unique
-        constraint on the key decides which of them is the one that happened.
+        Four answers, in the project's own vocabulary:
+
+        - ``None`` — no such request; the caller goes on to validate and commit.
+        - ``DUPLICATE`` — the same work under one of its names; the original
+          receipt, unchanged apart from the outcome.
+        - ``CONFLICT`` — one of those names already stands for different work,
+          or for someone else's.
+        - :class:`RequestIdentityConflict` — the two names disagree about which
+          request this is. That is not a case to resolve by picking one.
+
+        This runs before validation and again after a state-dependent failure,
+        because a winner can commit in between. It is a correctness path and a
+        fast path; the uniqueness constraints in the database remain the
+        protection.
         """
-        stored = self.store.receipt_for(owner_id=owner_id, idempotency_key=idempotency_key)
+        by_key = self.store.receipt_for(owner_id=owner_id, idempotency_key=idempotency_key)
+        by_request = self.store.receipt_for_request(request_id)
+
+        if (
+            by_key is not None
+            and by_request is not None
+            and not by_key.is_same_request_as(by_request)
+        ):
+            raise RequestIdentityConflict(
+                f"idempotency key {idempotency_key} and request {request_id} "
+                "name two different stored requests"
+            )
+
+        stored = by_key or by_request
         if stored is None:
             return None
-        if stored.fingerprint != fingerprint:
+        if stored.owner_id != owner_id or stored.fingerprint != fingerprint:
+            # An owner mismatch is answered exactly as a fingerprint mismatch is,
+            # and says no more. Whose request it is, and what it did, are not
+            # this caller's to learn by guessing an id.
             return GraphWriteReceipt(
                 outcome=GraphWriteOutcome.CONFLICT,
                 request_id=request_id,
                 correlation_id=correlation_id,
                 idempotency_key=idempotency_key,
                 detail=(
-                    f"idempotency key {idempotency_key} was already used "
-                    "for a different set of writes"
+                    f"idempotency key {idempotency_key} or request {request_id} "
+                    "was already used for a different set of writes"
                 ),
             )
         return stored.receipt.model_copy(update={"outcome": GraphWriteOutcome.DUPLICATE})

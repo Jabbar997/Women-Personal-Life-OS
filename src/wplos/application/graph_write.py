@@ -285,12 +285,25 @@ class GraphWriteBatch(BaseModel):
 
 
 class StoredReceipt(BaseModel):
-    """A receipt as the store kept it, next to the fingerprint that identifies it."""
+    """A durable request as the store kept it: both its identities and its answer.
+
+    A request is reachable two ways — by ``(owner_id, idempotency_key)`` and by
+    ``request_id`` — so a look-up has to be able to say *which* request it found,
+    not merely produce a receipt. Two look-ups that disagree are a contradiction
+    the caller must be told about rather than one the service resolves by
+    picking.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    owner_id: UserId
+    idempotency_key: str
+    request_id: RequestId
     fingerprint: str
     receipt: GraphWriteReceipt
+
+    def is_same_request_as(self, other: "StoredReceipt") -> bool:
+        return (self.owner_id, self.idempotency_key) == (other.owner_id, other.idempotency_key)
 
 
 class GraphWriteStore(Protocol):
@@ -308,6 +321,16 @@ class GraphWriteStore(Protocol):
     def active_entities(self, *, owner_id: UserId, at: datetime) -> tuple[Entity, ...]: ...
 
     def receipt_for(self, *, owner_id: UserId, idempotency_key: str) -> StoredReceipt | None: ...
+
+    def receipt_for_request(self, request_id: RequestId) -> StoredReceipt | None:
+        """The durable request filed under this run id, whoever it belongs to.
+
+        Not owner-scoped, deliberately: a request id is unique across the store,
+        so the caller has to be able to see that one exists before deciding
+        whether it is theirs. The application checks the owner; the store does
+        not pretend the row is absent.
+        """
+        ...
 
     def run_record(self, request_id: RequestId) -> RuntimeRunRecord | None: ...
 
