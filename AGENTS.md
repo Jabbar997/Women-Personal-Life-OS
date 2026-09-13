@@ -227,6 +227,14 @@ them.
   may serialize a record; it may not define a second, weaker shape of it.
 - Committing a graph mutation without the event announcing it, in the same
   transaction.
+- Writing against a stored record without naming the revision it was built on.
+  Closing is a write like any other.
+- Moving a record between owners, or reopening a closed one, by handing the
+  application a fully constructed `Entity` that went around the domain helper.
+- Copying free-text provenance (`SourceRef.detail`) into anything durable that
+  leaves the record. Events name where a fact came from, not what she said.
+- Letting a resolver decide who authorized a write. It resolves data; the
+  `SanctionedWrite` decides the mind, the operation and the target.
 - Giving a mind a handle to a mutable graph. Minds propose writes; the
   application layer decides whether the graph accepts them.
 - Putting business reasoning in the Orchestrator. It routes, coordinates,

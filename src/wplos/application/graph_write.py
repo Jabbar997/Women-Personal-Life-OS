@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wplos.agents.contracts import GraphWriteIntent, WriteOperation
 from wplos.application.result import RuntimeStatus
+from wplos.application.writes import SanctionedWrite
 from wplos.core.identifiers import CorrelationId, EntityId, EventId, RequestId, UserId
 from wplos.core.records import RecordStatus
 from wplos.core.roles import AgentName
@@ -49,7 +50,14 @@ class GraphWriteOutcome(StrEnum):
 
 
 class ResolvedGraphWrite(BaseModel):
-    """One intent, resolved into the mutation it actually asks for.
+    """One sanctioned request, resolved into the mutation it actually asks for.
+
+    The authority half is not restated here, it is carried: ``sanctioned`` is
+    the same value the runtime produced after ``enforce_output``, and the agent,
+    the operation, the entity type and the target are read from it. A resolver
+    fills in data — the concrete entity, the revision it was built on, the
+    closure — and has no field in which to put a different mind or a different
+    target.
 
     Shape is guaranteed here; agreement with what is already in the graph is
     not. Whether the entity's type matches the intent, whether the owner owns
@@ -59,13 +67,20 @@ class ResolvedGraphWrite(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    intent: GraphWriteIntent
+    sanctioned: SanctionedWrite
     owner_id: UserId
-    proposed_by: AgentName
     entity: Entity | None = None
     expected_revision: int | None = Field(default=None, ge=1)
     close_status: RecordStatus | None = None
     closed_at: datetime | None = None
+
+    @property
+    def intent(self) -> GraphWriteIntent:
+        return self.sanctioned.intent
+
+    @property
+    def proposed_by(self) -> AgentName:
+        return self.sanctioned.agent
 
     @property
     def operation(self) -> WriteOperation:
@@ -110,6 +125,11 @@ class ResolvedGraphWrite(BaseModel):
                     raise ValueError("ACTIVE is not a closure")
                 if self.closed_at is None:
                     raise ValueError("a CLOSE must say when it closed")
+                if self.expected_revision is None:
+                    # Closing is a write like any other. A close built against
+                    # what she saw a minute ago must not silently close what
+                    # someone else has written since.
+                    raise ValueError("a CLOSE must name the revision it was built on")
         return self
 
     def logical_terms(self) -> dict[str, object]:
@@ -120,6 +140,10 @@ class ResolvedGraphWrite(BaseModel):
         capture bookkeeping on the source. All of them change between two
         attempts at the same command, and an idempotency key that changes on
         every retry protects nothing.
+
+        ``closed_at`` is *not* one of them. It sets ``temporal.valid_until``, so
+        it decides what the graph says about last Tuesday; closing at a
+        different time is a different closure, not the same one retried.
         """
         terms: dict[str, object] = {
             "operation": str(self.intent.operation),
@@ -129,6 +153,9 @@ class ResolvedGraphWrite(BaseModel):
             "target_entity_id": self.intent.entity_id,
             "expected_revision": self.expected_revision,
             "close_status": None if self.close_status is None else str(self.close_status),
+            "closed_at": (
+                None if self.closed_at is None else ensure_utc(self.closed_at).isoformat()
+            ),
         }
         if self.entity is not None:
             terms["entity"] = _entity_terms(self.entity)

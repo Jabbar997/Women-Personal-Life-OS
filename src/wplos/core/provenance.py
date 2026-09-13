@@ -68,3 +68,14 @@ class SourceRef(BaseModel):
     @property
     def is_inferential(self) -> bool:
         return self.source_type.is_inferential
+
+    def without_free_text(self) -> "SourceRef":
+        """This provenance as something durable may repeat it.
+
+        ``detail`` is whatever was written down when the fact was captured, and
+        that is often her own words. Anything that leaves the record — a
+        persisted event, an announcement to a consumer — needs to say where a
+        fact came from, not to keep a second, unclassified copy of what she
+        said. The bounded fields survive; the prose does not.
+        """
+        return self.model_copy(update={"detail": None})

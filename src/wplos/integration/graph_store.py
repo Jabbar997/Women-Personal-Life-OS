@@ -36,7 +36,7 @@ from wplos.integration.sqlite_support import connect, now_iso
 from wplos.integration.sqlite_support import transaction as write_transaction
 from wplos.integration.store import OutboxState
 from wplos.personal_life_graph.entity import Entity
-from wplos.shared.errors import ConcurrentModification
+from wplos.shared.errors import ConcurrentModification, InvariantViolation
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS graph_entity_versions (
@@ -67,11 +67,14 @@ CREATE TABLE IF NOT EXISTS graph_outbox (
 CREATE TABLE IF NOT EXISTS graph_write_requests (
     owner_id TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
+    request_id TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
     receipt_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY(owner_id, idempotency_key)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS graph_write_request_run
+    ON graph_write_requests(request_id);
 CREATE TABLE IF NOT EXISTS graph_runs (
     request_id TEXT PRIMARY KEY,
     record_json TEXT NOT NULL,
@@ -215,31 +218,33 @@ class SQLiteGraphStore:
             claimed = connection.execute(
                 """
                 INSERT INTO graph_write_requests(
-                    owner_id, idempotency_key, fingerprint, receipt_json, created_at
-                ) VALUES(?,?,?,?,?)
-                ON CONFLICT(owner_id, idempotency_key) DO NOTHING
+                    owner_id, idempotency_key, request_id, fingerprint, receipt_json, created_at
+                ) VALUES(?,?,?,?,?,?)
+                ON CONFLICT DO NOTHING
                 """,
                 (
                     str(batch.owner_id),
                     batch.idempotency_key,
+                    str(batch.run.request_id),
                     batch.fingerprint,
                     receipt.model_dump_json(),
                     stamp,
                 ),
             )
             if claimed.rowcount == 0:
-                # The key is the guard, and it is the database that enforces it.
-                # Reaching here means another attempt already owns this request,
-                # so this one writes nothing whatever it was carrying.
+                # Two uniqueness rules can send us here, and the database owns
+                # both: the idempotency key, and the request id that names the
+                # run. Either way another attempt already holds this request, so
+                # this one writes nothing whatever it was carrying.
                 return self._already_seen(connection, batch)
             for commit in batch.commits:
                 self._write_version(connection, commit, stamp)
                 self._write_event(connection, batch, commit, stamp)
+            # A plain insert. A claimed request id cannot already have a run, so
+            # a clash here is a contradiction and should be loud rather than
+            # quietly leaving the first run record describing the second batch.
             connection.execute(
-                """
-                INSERT INTO graph_runs(request_id, record_json, created_at) VALUES(?,?,?)
-                ON CONFLICT(request_id) DO NOTHING
-                """,
+                "INSERT INTO graph_runs(request_id, record_json, created_at) VALUES(?,?,?)",
                 (str(batch.run.request_id), batch.run.model_dump_json(), stamp),
             )
         return receipt
@@ -253,69 +258,109 @@ class SQLiteGraphStore:
     def _already_seen(
         self, connection: sqlite3.Connection, batch: GraphWriteBatch
     ) -> GraphWriteReceipt:
-        row = connection.execute(
+        by_key = connection.execute(
             """
             SELECT fingerprint, receipt_json FROM graph_write_requests
             WHERE owner_id=? AND idempotency_key=?
             """,
             (str(batch.owner_id), batch.idempotency_key),
         ).fetchone()
-        if row is None:
+        if by_key is not None:
+            return self._answer(
+                _stored_receipt(by_key),
+                batch,
+                clash=f"idempotency key {batch.idempotency_key}",
+            )
+        by_run = connection.execute(
+            """
+            SELECT fingerprint, receipt_json FROM graph_write_requests WHERE request_id=?
+            """,
+            (str(batch.run.request_id),),
+        ).fetchone()
+        if by_run is None:
             raise RuntimeError("the conflicting request vanished before it could be read")
-        stored = _stored_receipt(row)
+        return self._answer(_stored_receipt(by_run), batch, clash=f"request {batch.run.request_id}")
+
+    def _answer(
+        self, stored: StoredReceipt, batch: GraphWriteBatch, *, clash: str
+    ) -> GraphWriteReceipt:
+        """The same work is the same answer; different work under one name is not."""
         if stored.fingerprint != batch.fingerprint:
             return GraphWriteReceipt(
                 outcome=GraphWriteOutcome.CONFLICT,
                 request_id=batch.run.request_id,
                 correlation_id=batch.run.correlation_id,
                 idempotency_key=batch.idempotency_key,
-                detail=(
-                    f"idempotency key {batch.idempotency_key} was already used "
-                    "for a different set of writes"
-                ),
+                detail=f"{clash} was already used for a different set of writes",
             )
         return stored.receipt.model_copy(update={"outcome": GraphWriteOutcome.DUPLICATE})
 
     def _write_version(
         self, connection: sqlite3.Connection, commit: GraphCommit, stamp: str
     ) -> None:
-        """Append the new version, unless someone has already moved past it.
+        """Append the successor of the exact version this write was built on.
 
         The guard is in the statement rather than in a read beforehand: two
         writers built on the same revision both reach here, both run this, and
         the one that arrives second inserts nothing. ``PRIMARY KEY(entity_id,
         revision)`` stands behind it as the constraint that cannot be raced at
         all.
+
+        It names the predecessor rather than merely refusing to go backwards.
+        "Nothing at or beyond revision N" would also accept revision 4 written
+        onto an empty entity, leaving a history with a hole in it that no
+        as-of query could read honestly.
         """
         entity = commit.entity
+        expected = commit.expected_revision
+        if expected is not None and entity.revision != expected + 1:
+            raise InvariantViolation(
+                f"a revision must be the successor of the one it was built on, "
+                f"{expected} -> {entity.revision}"
+            )
+        if expected is None and entity.revision != 1:
+            raise InvariantViolation("a first version must be revision 1")
+        values = (
+            str(entity.id),
+            entity.revision,
+            str(entity.owner_id),
+            str(entity.entity_type),
+            str(entity.status),
+            entity.model_dump_json(),
+            stamp,
+        )
+        if expected is None:
+            cursor = connection.execute(
+                """
+                INSERT INTO graph_entity_versions(
+                    entity_id, revision, owner_id, entity_type, status, entity_json, recorded_at
+                )
+                SELECT ?,?,?,?,?,?,?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM graph_entity_versions WHERE entity_id=?
+                )
+                """,
+                (*values, str(entity.id)),
+            )
+            if cursor.rowcount == 1:
+                return
+            raise ConcurrentModification(f"{entity.id} already exists in the graph")
         cursor = connection.execute(
             """
             INSERT INTO graph_entity_versions(
                 entity_id, revision, owner_id, entity_type, status, entity_json, recorded_at
             )
             SELECT ?,?,?,?,?,?,?
-            WHERE NOT EXISTS (
-                SELECT 1 FROM graph_entity_versions WHERE entity_id=? AND revision>=?
-            )
+            WHERE (
+                SELECT MAX(revision) FROM graph_entity_versions WHERE entity_id=?
+            ) IS ?
             """,
-            (
-                str(entity.id),
-                entity.revision,
-                str(entity.owner_id),
-                str(entity.entity_type),
-                str(entity.status),
-                entity.model_dump_json(),
-                stamp,
-                str(entity.id),
-                entity.revision,
-            ),
+            (*values, str(entity.id), expected),
         )
         if cursor.rowcount == 1:
             return
-        if commit.expected_revision is None:
-            raise ConcurrentModification(f"{entity.id} already exists in the graph")
         raise ConcurrentModification(
-            f"{entity.id} has moved past revision {commit.expected_revision}; "
+            f"{entity.id} is not at revision {expected}; "
             "the write was built on a version that is no longer current"
         )
 

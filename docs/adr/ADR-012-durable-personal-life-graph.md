@@ -49,14 +49,19 @@ only through the domain model.**
    SQL predicate. An invalidated record was never true and an expired one was
    true once; re-encoding that distinction in a `WHERE` clause would be a second
    implementation of a rule that already exists.
-5. Optimistic concurrency is enforced **by the write itself**: the insert carries
-   `WHERE NOT EXISTS (… revision >= ?)`, and `PRIMARY KEY(entity_id, revision)`
-   stands behind it. A check performed before the write is a check two workers
-   can both pass.
-6. The adapter is `wplos.integration.graph_store`, behind the `GraphWriteStore`
+5. Optimistic concurrency is enforced **by the write itself**: the insert names
+   the predecessor — `WHERE (SELECT MAX(revision) …) IS ?` — and
+   `PRIMARY KEY(entity_id, revision)` stands behind it. A check performed before
+   the write is a check two workers can both pass.
+6. The predecessor must be **exact**, not merely older. "Nothing at or beyond
+   revision N" would accept revision 4 written onto an empty entity, leaving a
+   history with a hole in it; an as-of query over that history cannot answer
+   honestly, and nothing would ever tell us the hole is there. A successor that
+   is not `expected + 1` is a caller bug and raises `InvariantViolation`.
+7. The adapter is `wplos.integration.graph_store`, behind the `GraphWriteStore`
    port in `wplos.application.graph_write`. The application depends on the port;
    the outer layer implements it. Layering is unchanged and still tested.
-7. Both durable stores share one connection and transaction mechanism in
+8. Both durable stores share one connection and transaction mechanism in
    `wplos.integration.sqlite_support`: `BEGIN IMMEDIATE`, WAL, a busy timeout,
    rollback on any exit that is not clean.
 

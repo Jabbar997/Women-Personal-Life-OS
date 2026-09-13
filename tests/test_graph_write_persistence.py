@@ -6,10 +6,12 @@ not been remembered, and a graph mutation whose event was lost is a change
 nobody downstream will ever hear about.
 """
 
-from collections.abc import Iterator
+import sqlite3
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -23,14 +25,17 @@ from wplos.application.graph_write import (
     GraphCommit,
     GraphWriteBatch,
     GraphWriteOutcome,
+    GraphWriteReceipt,
     ResolvedGraphWrite,
     RuntimeRunRecord,
+    StoredReceipt,
 )
 from wplos.application.graph_write_service import GraphWriteService
 from wplos.application.request import RuntimeRequest
 from wplos.application.result import RuntimeStatus
 from wplos.application.writes import SanctionedWrite
 from wplos.core.attribution import Attribution
+from wplos.core.confidence import Confidence
 from wplos.core.identifiers import (
     CorrelationId,
     EntityId,
@@ -39,9 +44,11 @@ from wplos.core.identifiers import (
     new_correlation_id,
     new_request_id,
 )
+from wplos.core.provenance import SourceRef, SourceType
 from wplos.core.records import RecordStatus
 from wplos.core.roles import AgentName
 from wplos.core.sensitivity import SensitivityLevel
+from wplos.core.temporal import TemporalMarkers, TemporalValidity
 from wplos.events.envelope import Actor, DomainEvent, Subject
 from wplos.events.payloads import GraphMutationPayload
 from wplos.events.types import EventType
@@ -83,6 +90,18 @@ def service(store: SQLiteGraphStore) -> GraphWriteService:
     return GraphWriteService(store=store)
 
 
+PRIVATE = "she said she is leaving him and needs the dress money back"
+
+
+def _source(*, reference: str | None = None, detail: str | None = None) -> SourceRef:
+    return SourceRef(
+        source_type=SourceType.USER_DECLARED,
+        captured_at=NOW,
+        reference=reference,
+        detail=detail,
+    )
+
+
 def commitment(
     *,
     owner: UserId = OWNER,
@@ -90,15 +109,23 @@ def commitment(
     state: OpenLoopState = OpenLoopState.CAPTURED,
     at: datetime = NOW,
     due_at: datetime | None = None,
+    source: SourceRef | None = None,
 ) -> Entity:
-    from wplos.core.temporal import TemporalMarkers
-
+    attribution = (
+        Attribution.declared(at, default_sensitivity(EntityType.COMMITMENT))
+        if source is None
+        else Attribution(
+            source=source,
+            confidence=Confidence.certain(),
+            sensitivity=default_sensitivity(EntityType.COMMITMENT),
+        )
+    )
     return Entity.create(
         owner_id=owner,
         entity_type=EntityType.COMMITMENT,
         label=label,
         attributes=CommitmentAttributes(kind=CommitmentKind.RETURN, state=state),
-        attribution=Attribution.declared(at, default_sensitivity(EntityType.COMMITMENT)),
+        attribution=attribution,
         at=at,
         markers=TemporalMarkers(due_at=due_at),
     )
@@ -128,21 +155,30 @@ def body_signal(*, owner: UserId = OWNER) -> Entity:
     )
 
 
+def sanctioned(
+    intent: GraphWriteIntent, agent: AgentName = AgentName.LIFE_ADMIN
+) -> SanctionedWrite:
+    return SanctionedWrite(agent=agent, intent=intent)
+
+
 def create_write(
     entity: Entity,
     *,
     agent: AgentName = AgentName.LIFE_ADMIN,
     owner: UserId = OWNER,
     declared_type: EntityType | None = None,
+    summary: str = "she said it in passing",
 ) -> ResolvedGraphWrite:
     return ResolvedGraphWrite(
-        intent=GraphWriteIntent(
-            entity_type=declared_type or entity.entity_type,
-            operation=WriteOperation.CREATE,
-            summary="she said it in passing",
+        sanctioned=sanctioned(
+            GraphWriteIntent(
+                entity_type=declared_type or entity.entity_type,
+                operation=WriteOperation.CREATE,
+                summary=summary,
+            ),
+            agent,
         ),
         owner_id=owner,
-        proposed_by=agent,
         entity=entity,
     )
 
@@ -162,14 +198,16 @@ def revise_write(
         else current.attributes_as(CommitmentAttributes).model_copy(update={"state": state})
     )
     return ResolvedGraphWrite(
-        intent=GraphWriteIntent(
-            entity_type=current.entity_type,
-            operation=WriteOperation.REVISE,
-            entity_id=current.id,
-            summary="she corrected it",
+        sanctioned=sanctioned(
+            GraphWriteIntent(
+                entity_type=current.entity_type,
+                operation=WriteOperation.REVISE,
+                entity_id=current.id,
+                summary="she corrected it",
+            ),
+            agent,
         ),
         owner_id=owner,
-        proposed_by=agent,
         entity=current.revised(at=at, label=label, attributes=attributes),
         expected_revision=current.revision,
     )
@@ -181,18 +219,21 @@ def close_write(
     at: datetime = LATER,
     status: RecordStatus = RecordStatus.ARCHIVED,
     owner: UserId = OWNER,
+    expected_revision: int | None = None,
 ) -> ResolvedGraphWrite:
     return ResolvedGraphWrite(
-        intent=GraphWriteIntent(
-            entity_type=current.entity_type,
-            operation=WriteOperation.CLOSE,
-            entity_id=current.id,
-            summary="it is done with",
+        sanctioned=sanctioned(
+            GraphWriteIntent(
+                entity_type=current.entity_type,
+                operation=WriteOperation.CLOSE,
+                entity_id=current.id,
+                summary="it is done with",
+            )
         ),
         owner_id=owner,
-        proposed_by=AgentName.LIFE_ADMIN,
         close_status=status,
         closed_at=at,
+        expected_revision=(current.revision if expected_revision is None else expected_revision),
     )
 
 
@@ -289,15 +330,48 @@ class WritingAgent:
 
 
 class MappedResolver:
-    """Turns each intent into the concrete typed mutation the test prepared."""
+    """Turns each intent into the concrete typed entity the test prepared.
 
-    def __init__(self, by_summary: dict[str, ResolvedGraphWrite]) -> None:
+    It composes the resolved write around the ``SanctionedWrite`` it was handed,
+    which is what a real resolver does: it supplies data, not authority.
+    """
+
+    def __init__(self, by_summary: dict[str, Entity]) -> None:
         self.by_summary = by_summary
 
     def resolve(
-        self, sanctioned: SanctionedWrite, *, owner_id: UserId, at: datetime
+        self, request: SanctionedWrite, *, owner_id: UserId, at: datetime
     ) -> ResolvedGraphWrite:
-        return self.by_summary[sanctioned.intent.summary]
+        return ResolvedGraphWrite(
+            sanctioned=request,
+            owner_id=owner_id,
+            entity=self.by_summary[request.intent.summary],
+        )
+
+
+class SubstitutingResolver:
+    """A resolver that hands back a write attributed to something else."""
+
+    def __init__(
+        self,
+        substitute: SanctionedWrite,
+        entity: Entity,
+        *,
+        expected_revision: int | None = None,
+    ) -> None:
+        self.substitute = substitute
+        self.entity = entity
+        self.expected_revision = expected_revision
+
+    def resolve(
+        self, request: SanctionedWrite, *, owner_id: UserId, at: datetime
+    ) -> ResolvedGraphWrite:
+        return ResolvedGraphWrite(
+            sanctioned=self.substitute,
+            owner_id=owner_id,
+            entity=self.entity,
+            expected_revision=self.expected_revision,
+        )
 
 
 # --- 01 ----------------------------------------------------------------------
@@ -611,14 +685,15 @@ def test_10_a_revision_cannot_change_what_an_entity_is(service, store):
         service,
         (
             ResolvedGraphWrite(
-                intent=GraphWriteIntent(
-                    entity_type=EntityType.TASK,
-                    operation=WriteOperation.REVISE,
-                    entity_id=entity.id,
-                    summary="call it a task instead",
+                sanctioned=sanctioned(
+                    GraphWriteIntent(
+                        entity_type=EntityType.TASK,
+                        operation=WriteOperation.REVISE,
+                        entity_id=entity.id,
+                        summary="call it a task instead",
+                    )
                 ),
                 owner_id=OWNER,
-                proposed_by=AgentName.LIFE_ADMIN,
                 entity=entity.revised(at=LATER, label="now a task"),
                 expected_revision=1,
             ),
@@ -641,14 +716,15 @@ def test_10_a_revision_carrying_a_different_kind_of_entity_is_rejected(service, 
         service,
         (
             ResolvedGraphWrite(
-                intent=GraphWriteIntent(
-                    entity_type=EntityType.COMMITMENT,
-                    operation=WriteOperation.REVISE,
-                    entity_id=entity.id,
-                    summary="quietly a task now",
+                sanctioned=sanctioned(
+                    GraphWriteIntent(
+                        entity_type=EntityType.COMMITMENT,
+                        operation=WriteOperation.REVISE,
+                        entity_id=entity.id,
+                        summary="quietly a task now",
+                    )
                 ),
                 owner_id=OWNER,
-                proposed_by=AgentName.LIFE_ADMIN,
                 entity=impostor,
                 expected_revision=1,
             ),
@@ -874,7 +950,7 @@ def test_a_sanctioned_runtime_write_is_persisted_through_the_service(service, st
     receipt = service.apply_runtime_result(
         result,
         owner_id=OWNER,
-        resolver=MappedResolver({intent.summary: create_write(entity)}),
+        resolver=MappedResolver({intent.summary: entity}),
         idempotency_key="k-runtime",
         now=NOW,
     )
@@ -898,7 +974,7 @@ def test_a_blocked_run_persists_nothing(service, store):
     receipt = service.apply_runtime_result(
         result,
         owner_id=OWNER,
-        resolver=MappedResolver({intent.summary: create_write(commitment())}),
+        resolver=MappedResolver({intent.summary: commitment()}),
         idempotency_key="k-blocked",
         now=NOW,
     )
@@ -1002,12 +1078,15 @@ def test_an_event_is_classified_as_sharply_as_the_record_it_is_about(service, st
 
 
 def test_an_event_carries_the_provenance_of_the_record_it_announces(service, store):
-    entity = commitment()
+    entity = commitment(source=_source(reference="msg_42", detail=PRIVATE))
     apply(service, (create_write(entity),), key="k1")
 
     event = store.pending_events()[0].event
 
-    assert event.source == entity.attribution.source
+    assert event.source.source_type is entity.source.source_type
+    assert event.source.captured_at == entity.source.captured_at
+    assert event.source.reference == "msg_42"
+    assert event.source.detail is None
 
 
 def test_the_event_and_the_revision_it_announces_are_one_to_one(service, store):
@@ -1052,3 +1131,388 @@ def test_an_unknown_entity_reads_back_as_absent_rather_than_as_an_empty_record(s
     assert store.current_entity(EntityId("ent_nothing")) is None
     assert store.entity_versions(EntityId("ent_nothing")) == ()
     assert store.active_entities(owner_id=OWNER, at=NOW) == ()
+
+
+# --- review round 1: B01-B08 and N01 -----------------------------------------
+
+
+class RacingGraphStore(SQLiteGraphStore):
+    """A store that lets another caller commit inside this one's idempotency look-up.
+
+    The interleaving that matters is: A looks up the key and finds nothing, B
+    commits the identical request, A then validates against the state B left.
+    The hook fires on the first miss and A still receives the answer its look-up
+    actually saw, which is what makes the race deterministic without a sleep.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.on_first_miss: Callable[[], None] | None = None
+
+    def receipt_for(self, *, owner_id: UserId, idempotency_key: str) -> StoredReceipt | None:
+        found = super().receipt_for(owner_id=owner_id, idempotency_key=idempotency_key)
+        if found is None and self.on_first_miss is not None:
+            hook, self.on_first_miss = self.on_first_miss, None
+            hook()
+        return found
+
+
+def _apply_one(
+    service: GraphWriteService, write: ResolvedGraphWrite, *, key: str
+) -> GraphWriteReceipt:
+    return service.apply(
+        (write,),
+        owner_id=OWNER,
+        request_id=new_request_id(),
+        correlation_id=new_correlation_id(),
+        idempotency_key=key,
+        now=NOW,
+    )
+
+
+def test_revise_must_not_transfer_owner(service, store):
+    """B01 — a revision changes what a record says, never whose it is."""
+    entity = commitment()
+    apply(service, (create_write(entity),), key="k1")
+    hijacked = entity.revised(at=LATER, label="same loop").model_copy(update={"owner_id": STRANGER})
+
+    receipt = apply(
+        service,
+        (
+            ResolvedGraphWrite(
+                sanctioned=sanctioned(
+                    GraphWriteIntent(
+                        entity_type=EntityType.COMMITMENT,
+                        operation=WriteOperation.REVISE,
+                        entity_id=entity.id,
+                        summary="quietly hers now",
+                    )
+                ),
+                owner_id=OWNER,
+                entity=hijacked,
+                expected_revision=1,
+            ),
+        ),
+        key="k-transfer",
+    )
+
+    assert receipt.outcome is GraphWriteOutcome.REJECTED
+    assert "owner" in (receipt.detail or "")
+    assert len(store.entity_versions(entity.id)) == 1
+    assert store.current_entity(entity.id).owner_id == OWNER
+    assert store.count_events() == 1
+
+
+def test_close_must_honor_expected_revision(service, store):
+    """B02 — closing is a write, and a write names the version it saw."""
+    entity = commitment()
+    apply(service, (create_write(entity),), key="k1")
+    read_before = store.current_entity(entity.id)
+    apply(service, (revise_write(read_before, label="the shop moved"),), key="k2")
+
+    with pytest.raises(ConcurrentModification):
+        apply(service, (close_write(read_before, expected_revision=1),), key="k3")
+
+    assert store.current_entity(entity.id).status is RecordStatus.ACTIVE
+    assert len(store.entity_versions(entity.id)) == 2
+    assert store.count_events() == 2
+
+    closed = apply(service, (close_write(store.current_entity(entity.id)),), key="k4")
+
+    assert closed.outcome is GraphWriteOutcome.APPLIED
+    assert store.current_entity(entity.id).status is RecordStatus.ARCHIVED
+    assert len(store.entity_versions(entity.id)) == 3
+
+
+def test_close_time_is_part_of_idempotency(service, store):
+    """B03 — the closure time sets valid_until, so it is part of the command."""
+    entity = commitment()
+    apply(service, (create_write(entity),), key="k1")
+    current = store.current_entity(entity.id)
+
+    first = apply(service, (close_write(current, at=LATER),), key="k-close")
+    same_time = apply(service, (close_write(current, at=LATER),), key="k-close")
+    other_time = apply(
+        service, (close_write(current, at=LATER + timedelta(hours=3)),), key="k-close"
+    )
+
+    assert first.outcome is GraphWriteOutcome.APPLIED
+    assert same_time.outcome is GraphWriteOutcome.DUPLICATE
+    assert same_time.writes == first.writes
+    assert other_time.outcome is GraphWriteOutcome.CONFLICT
+    assert store.current_entity(entity.id).temporal.valid_until == LATER
+    assert len(store.entity_versions(entity.id)) == 2
+
+
+def test_close_time_in_another_zone_is_the_same_closure(service, store):
+    """The fingerprint normalises to UTC, so an offset is not a new command."""
+    entity = commitment()
+    apply(service, (create_write(entity),), key="k1")
+    current = store.current_entity(entity.id)
+    elsewhere = LATER.astimezone(ZoneInfo("Asia/Riyadh"))
+
+    first = apply(service, (close_write(current, at=LATER),), key="k-zone")
+    again = apply(service, (close_write(current, at=elsewhere),), key="k-zone")
+
+    assert first.outcome is GraphWriteOutcome.APPLIED
+    assert again.outcome is GraphWriteOutcome.DUPLICATE
+
+
+def test_retry_after_lookup_race_returns_duplicate(db):
+    """B04 — a retry that loses the race is a duplicate, never a rejection."""
+    racing = RacingGraphStore(db)
+    late = GraphWriteService(store=racing)
+    winner = GraphWriteService(store=SQLiteGraphStore(db))
+    write = create_write(commitment())
+    won: list[GraphWriteReceipt] = []
+    racing.on_first_miss = lambda: won.append(_apply_one(winner, write, key="k-race"))
+
+    answer = _apply_one(late, write, key="k-race")
+
+    assert won[0].outcome is GraphWriteOutcome.APPLIED
+    assert answer.outcome is GraphWriteOutcome.DUPLICATE
+    assert answer.writes == won[0].writes
+    assert racing.count_entity_versions() == 1
+    assert racing.count_events() == 1
+
+
+def test_retry_after_lookup_race_returns_duplicate_for_a_revision(db):
+    """The same race on a REVISE, where the loser's read is now stale."""
+    setup = GraphWriteService(store=SQLiteGraphStore(db))
+    entity = commitment()
+    _apply_one(setup, create_write(entity), key="k-setup")
+
+    racing = RacingGraphStore(db)
+    late = GraphWriteService(store=racing)
+    winner = GraphWriteService(store=SQLiteGraphStore(db))
+    write = revise_write(entity, label="the shop moved")
+    won: list[GraphWriteReceipt] = []
+    racing.on_first_miss = lambda: won.append(_apply_one(winner, write, key="k-race"))
+
+    answer = _apply_one(late, write, key="k-race")
+
+    assert won[0].outcome is GraphWriteOutcome.APPLIED
+    assert answer.outcome is GraphWriteOutcome.DUPLICATE
+    assert answer.writes == won[0].writes
+    assert len(racing.entity_versions(entity.id)) == 2
+    assert racing.count_events() == 2
+
+
+def test_a_genuinely_stale_revision_under_its_own_key_still_raises(db):
+    """The re-check answers a retry, not every failure. A different request that
+    lost a revision race is still a conflict the caller must see."""
+    service = GraphWriteService(store=SQLiteGraphStore(db))
+    entity = commitment()
+    _apply_one(service, create_write(entity), key="k-setup")
+    _apply_one(service, revise_write(entity, label="from the phone"), key="k-a")
+
+    with pytest.raises(ConcurrentModification):
+        _apply_one(service, revise_write(entity, label="from the laptop"), key="k-b")
+
+
+def test_event_does_not_copy_free_text_source_detail(service, store, db):
+    """B05 — the announcement names where a fact came from, not what she said."""
+    entity = commitment(source=_source(reference="msg_42", detail=PRIVATE))
+
+    apply(service, (create_write(entity),), key="k1")
+
+    with sqlite3.connect(db) as raw:
+        rows = raw.execute("SELECT envelope_json FROM graph_outbox").fetchall()
+    persisted = "".join(str(row[0]) for row in rows)
+
+    assert rows
+    assert PRIVATE not in persisted
+    assert PRIVATE in store.current_entity(entity.id).model_dump_json()
+    assert "msg_42" in persisted
+    assert store.pending_events()[0].event.source.detail is None
+
+
+def test_resolver_must_preserve_sanctioned_agent_and_intent(service, store):
+    """B06 — a resolver resolves data. It does not decide who authorized it."""
+    harness = build_harness()
+    intent = GraphWriteIntent(
+        entity_type=EntityType.COMMITMENT,
+        operation=WriteOperation.CREATE,
+        summary="the dress goes back on Thursday",
+    )
+    harness.runtime.agents[AgentName.LIFE_ADMIN] = WritingAgent(AgentName.LIFE_ADMIN, (intent,))
+    request = RuntimeRequest.from_user(user_id=OWNER, at=NOW, utterance="the dress goes back")
+    result = harness.runtime.run(request, graph=harness.graph, intent=Intent.CAPTURE, now=NOW)
+    # A substitution the contract check alone would wave through: the Operator
+    # may write commitments too. Only the binding to what was sanctioned catches
+    # it.
+    substitute = SanctionedWrite(
+        agent=AgentName.OPERATOR,
+        intent=GraphWriteIntent(
+            entity_type=EntityType.COMMITMENT,
+            operation=WriteOperation.CREATE,
+            summary="something nobody asked for",
+        ),
+    )
+
+    with pytest.raises(ContractViolation):
+        service.apply_runtime_result(
+            result,
+            owner_id=OWNER,
+            resolver=SubstitutingResolver(substitute, commitment()),
+            idempotency_key="k-substitute",
+            now=NOW,
+        )
+
+    assert store.count_entity_versions() == 0
+    assert store.count_events() == 0
+
+
+def test_resolver_must_preserve_the_target_of_a_revision(service, store):
+    entity = commitment()
+    apply(service, (create_write(entity),), key="k1")
+    elsewhere = commitment(label="a different loop entirely")
+    apply(service, (create_write(elsewhere),), key="k2")
+
+    harness = build_harness()
+    intent = GraphWriteIntent(
+        entity_type=EntityType.COMMITMENT,
+        operation=WriteOperation.REVISE,
+        entity_id=entity.id,
+        summary="she corrected it",
+    )
+    harness.runtime.agents[AgentName.LIFE_ADMIN] = WritingAgent(AgentName.LIFE_ADMIN, (intent,))
+    request = RuntimeRequest.from_user(user_id=OWNER, at=NOW, utterance="correct it")
+    result = harness.runtime.run(request, graph=harness.graph, intent=Intent.CAPTURE, now=NOW)
+    swapped = SanctionedWrite(
+        agent=AgentName.LIFE_ADMIN,
+        intent=GraphWriteIntent(
+            entity_type=EntityType.COMMITMENT,
+            operation=WriteOperation.REVISE,
+            entity_id=elsewhere.id,
+            summary="she corrected it",
+        ),
+    )
+
+    with pytest.raises(ContractViolation):
+        service.apply_runtime_result(
+            result,
+            owner_id=OWNER,
+            resolver=SubstitutingResolver(
+                swapped,
+                elsewhere.revised(at=LATER, label="not what she meant"),
+                expected_revision=1,
+            ),
+            idempotency_key="k-swap-target",
+            now=NOW,
+        )
+
+    assert len(store.entity_versions(elsewhere.id)) == 1
+    assert store.count_events() == 2
+
+
+def test_run_record_does_not_silently_drop_second_batch(service, store):
+    """B07 — one request id is one run. A second, different batch under it is a
+    contradiction, not a write whose run record quietly describes something else."""
+    request_id = new_request_id()
+    kept = commitment(label="Return the dress")
+
+    first = apply(service, (create_write(kept),), key="k1", request_id=request_id)
+    second = apply(
+        service,
+        (create_write(commitment(label="Cancel the gym")),),
+        key="k2",
+        request_id=request_id,
+    )
+
+    assert first.outcome is GraphWriteOutcome.APPLIED
+    assert second.outcome is GraphWriteOutcome.CONFLICT
+    assert store.count_entity_versions() == 1
+    assert store.count_events() == 1
+    run = store.run_record(request_id)
+    assert run.entity_ids == (kept.id,)
+    assert run.event_ids == (first.writes[0].event_id,)
+
+
+def test_the_same_batch_under_one_request_id_is_a_retry_even_with_a_new_key(service, store):
+    request_id = new_request_id()
+
+    first = apply(service, (create_write(commitment()),), key="k1", request_id=request_id)
+    again = apply(service, (create_write(commitment()),), key="k2", request_id=request_id)
+
+    assert first.outcome is GraphWriteOutcome.APPLIED
+    assert again.outcome is GraphWriteOutcome.DUPLICATE
+    assert again.writes == first.writes
+    assert store.count_entity_versions() == 1
+    assert store.count_events() == 1
+
+
+def test_revise_cannot_reopen_closed_record(service, store):
+    """B08 — the lifecycle rule holds at the service boundary, not only in the
+    helper a caller may have gone around."""
+    entity = commitment()
+    apply(service, (create_write(entity),), key="k1")
+    apply(service, (close_write(store.current_entity(entity.id)),), key="k2")
+    closed = store.current_entity(entity.id)
+    reopened = closed.model_copy(
+        update={
+            "status": RecordStatus.ACTIVE,
+            "revision": 3,
+            "temporal": TemporalValidity.open_from(NOW),
+        }
+    )
+
+    receipt = apply(
+        service,
+        (
+            ResolvedGraphWrite(
+                sanctioned=sanctioned(
+                    GraphWriteIntent(
+                        entity_type=EntityType.COMMITMENT,
+                        operation=WriteOperation.REVISE,
+                        entity_id=entity.id,
+                        summary="open it again",
+                    )
+                ),
+                owner_id=OWNER,
+                entity=reopened,
+                expected_revision=2,
+            ),
+        ),
+        key="k-reopen",
+    )
+
+    assert receipt.outcome is GraphWriteOutcome.REJECTED
+    assert "cannot be revised" in (receipt.detail or "")
+    assert len(store.entity_versions(entity.id)) == 2
+    assert store.current_entity(entity.id).status is RecordStatus.ARCHIVED
+    assert store.count_events() == 2
+
+
+def test_store_requires_exact_predecessor(store):
+    """N01 — the adapter appends the successor of a named version, not merely
+    something newer. A history with a hole cannot be read honestly."""
+    entity = commitment()
+
+    ahead = entity.model_copy(update={"revision": 4})
+    with pytest.raises(ConcurrentModification):
+        store.commit(_batch(ahead, expected_revision=3, key="k-ahead"))
+    assert store.count_entity_versions() == 0
+
+    store.commit(_batch(entity, expected_revision=None, key="k-create"))
+
+    gap = entity.model_copy(update={"revision": 3})
+    with pytest.raises(ConcurrentModification):
+        store.commit(_batch(gap, expected_revision=2, key="k-gap"))
+    assert [version.revision for version in store.entity_versions(entity.id)] == [1]
+
+    store.commit(_batch(entity.revised(at=LATER, label="moved"), expected_revision=1, key="k-next"))
+
+    assert [version.revision for version in store.entity_versions(entity.id)] == [1, 2]
+
+
+def test_a_rejected_predecessor_leaves_no_event_behind(store):
+    entity = commitment()
+    store.commit(_batch(entity, expected_revision=None, key="k-create"))
+
+    with pytest.raises(ConcurrentModification):
+        store.commit(
+            _batch(entity.model_copy(update={"revision": 3}), expected_revision=2, key="k-gap")
+        )
+
+    assert store.count_events() == 1

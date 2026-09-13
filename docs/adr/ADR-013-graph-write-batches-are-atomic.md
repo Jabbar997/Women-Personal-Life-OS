@@ -42,21 +42,44 @@ unique constraint. Graph writes needed the same answer, not a different one.
    database. The same key with the same fingerprint returns the first attempt's
    receipt marked `DUPLICATE`; the same key with a different fingerprint is
    `CONFLICT` and writes nothing.
-5. The fingerprint covers what makes the command the command it is: operation,
-   owner, entity type, target, expected revision, closure, and the entity's
-   content. It deliberately excludes the entity id a `CREATE` mints, record time
-   (`created_at`/`updated_at`), the derived `revision`, and the capture
-   bookkeeping on the source — all of which differ between two attempts at the
-   same command. An idempotency key that changes on every retry protects
-   nothing.
-6. The service reads the stored receipt before validating, but that is a fast
+5. **`request_id` is a second identity, unique in the same table.** One request
+   id is one run. A second, different batch presented under a request id that
+   already has one is `CONFLICT`; the same batch arriving under a new key is
+   `DUPLICATE`. Without this, both batches committed their mutations while
+   `graph_runs` kept only the first — a durable contradiction, with a run record
+   describing work other than the work that happened. The run insert is now a
+   plain insert, so a clash there is loud rather than silently ignored.
+6. The fingerprint covers what makes the command the command it is: operation,
+   owner, entity type, target, expected revision, closure, the closure time
+   normalised to UTC, and the entity's content. It deliberately excludes the
+   entity id a `CREATE` mints, record time (`created_at`/`updated_at`), the
+   derived `revision`, and the capture bookkeeping on the source — all of which
+   differ between two attempts at the same command. An idempotency key that
+   changes on every retry protects nothing.
+7. **`closed_at` is not attempt metadata.** It sets `temporal.valid_until`, so
+   it decides what the graph says about last Tuesday. Closing at a different
+   time is a different closure, and treating it as noise would let one retry
+   silently rewrite history the first attempt had already written. It is
+   normalised to UTC before hashing, so the same instant expressed in another
+   zone is still the same closure.
+8. The service reads the stored receipt before validating, but that is a fast
    path and not the protection. It exists so a retried `CREATE` is not refused
    for having already succeeded. Two retries arriving together both see nothing
    there and both reach `commit`, where the unique constraint decides which one
    happened.
-7. A stale revision is not one of these outcomes. It is an invariant of the
-   graph, and it raises `ConcurrentModification` — the same exception the
-   in-memory graph has raised since Phase 01.
+9. **A retry can lose the race after its look-up.** It finds nothing, the winner
+   commits, and validation then fails against the state the winner left — the
+   entity already exists, or the revision has moved on. Before returning that
+   failure the service re-reads the durable record and returns the answer this
+   exact request has meanwhile been given. The re-read is deliberately narrow:
+   it can only ever produce the receipt the database actually holds, so a
+   genuinely stale write under its own key still raises.
+10. A stale revision is otherwise not one of these outcomes. It is an invariant
+    of the graph, and it raises `ConcurrentModification` — the same exception the
+    in-memory graph has raised since Phase 01. Every write against an existing
+    record names the version it saw, `CLOSE` included: a close prepared against
+    a revision someone has since moved past is refused, not applied to whatever
+    is current.
 
 ## Alternatives considered
 
@@ -90,6 +113,9 @@ unique constraint. Graph writes needed the same answer, not a different one.
 
 **Negative / trade-offs**
 
+- Making `request_id` unique means a caller that reuses one for genuinely
+  separate work gets a conflict rather than two runs. That is the intent, but it
+  does put the burden of minting a fresh request id on the caller.
 - A large batch is all-or-nothing, so one bad write costs the good ones. That is
   the point, but it means a caller assembling unrelated writes into one batch
   gets worse behaviour than it should. The fix is smaller batches, not partial

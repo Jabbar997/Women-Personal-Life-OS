@@ -56,6 +56,23 @@ class GraphWriteResolver(Protocol):
     ) -> ResolvedGraphWrite: ...
 
 
+def _bound(resolved: ResolvedGraphWrite, sanctioned: SanctionedWrite) -> ResolvedGraphWrite:
+    """The resolver may fill in data. It may not say who asked, or for what.
+
+    ``ResolvedGraphWrite`` carries the ``SanctionedWrite`` rather than restating
+    the agent and the intent, so there is no field in which to quietly change
+    the mind, the operation, the entity type or the target. This is the last
+    step: a resolver that hands back a different one is substituting authority
+    that no contract check ever saw.
+    """
+    if resolved.sanctioned != sanctioned:
+        raise ContractViolation(
+            f"the resolver returned a write attributed to {resolved.sanctioned.agent} "
+            f"for what {sanctioned.agent} asked to do to {sanctioned.intent.entity_type}"
+        )
+    return resolved
+
+
 class _Rejected(Exception):
     """Internal: a submitted command the graph will not accept."""
 
@@ -96,6 +113,15 @@ class GraphWriteService:
                 writes, owner_id=owner_id, correlation_id=correlation_id, at=now
             )
         except _Rejected as rejected:
+            raced = self._already_answered(
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
+                fingerprint=fingerprint,
+                request_id=request_id,
+                correlation_id=correlation_id,
+            )
+            if raced is not None:
+                return raced
             return GraphWriteReceipt(
                 outcome=GraphWriteOutcome.REJECTED,
                 request_id=request_id,
@@ -103,6 +129,17 @@ class GraphWriteService:
                 idempotency_key=idempotency_key,
                 detail=rejected.detail,
             )
+        except ConcurrentModification:
+            raced = self._already_answered(
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
+                fingerprint=fingerprint,
+                request_id=request_id,
+                correlation_id=correlation_id,
+            )
+            if raced is None:
+                raise
+            return raced
 
         batch = GraphWriteBatch(
             owner_id=owner_id,
@@ -147,7 +184,7 @@ class GraphWriteService:
                 detail="the run was blocked, so nothing it asked for is applied",
             )
         resolved = tuple(
-            resolver.resolve(sanctioned, owner_id=owner_id, at=now)
+            _bound(resolver.resolve(sanctioned, owner_id=owner_id, at=now), sanctioned)
             for sanctioned in result.sanctioned_writes
         )
         return self.apply(
@@ -254,19 +291,27 @@ class GraphWriteService:
                 self._check_agreement(write, stored)
                 if write.entity is None:
                     raise _Rejected("a REVISE must carry the next version of the entity")
-                if stored.revision != write.expected_revision:
-                    raise ConcurrentModification(
-                        f"{stored.id} is at revision {stored.revision}, "
-                        f"the write was built on revision {write.expected_revision}"
-                    )
+                if stored.status is not RecordStatus.ACTIVE:
+                    # The same rule ``Entity.revised`` has always enforced. A
+                    # fully constructed ACTIVE replacement must not be a way
+                    # around it: reopening a closed record is a decision, and
+                    # Phase 05 has no operation that makes it.
+                    raise _Rejected(f"{stored.id} is {stored.status} and cannot be revised")
+                self._check_revision(write, stored)
                 if write.entity.entity_type is not stored.entity_type:
                     raise _Rejected("an entity's type cannot change")
+                if write.entity.owner_id != stored.owner_id:
+                    # A revision changes what a record says, never whose it is.
+                    raise _Rejected(f"{stored.id} cannot change owner")
+                if write.entity.owner_id != write.owner_id:
+                    raise _Rejected("the replacement belongs to a different owner")
                 return write.entity, stored
             case WriteOperation.CLOSE:
                 stored = self._stored(write)
                 self._check_agreement(write, stored)
                 if stored.status is not RecordStatus.ACTIVE:
                     raise _Rejected(f"{stored.id} is already {stored.status}")
+                self._check_revision(write, stored)
                 if write.close_status is None or write.closed_at is None:
                     raise _Rejected("a CLOSE must say which closure it is, and when")
                 return stored.closed(at=write.closed_at, status=write.close_status), stored
@@ -295,6 +340,18 @@ class GraphWriteService:
             raise _Rejected(f"{entity_id} is not in the graph")
         return stored
 
+    def _check_revision(self, write: ResolvedGraphWrite, stored: Entity) -> None:
+        """Every write against an existing record names the version it saw.
+
+        Closing is not exempt. A close prepared against what she read a minute
+        ago must not quietly close what someone else has written since.
+        """
+        if stored.revision != write.expected_revision:
+            raise ConcurrentModification(
+                f"{stored.id} is at revision {stored.revision}, "
+                f"the write was built on revision {write.expected_revision}"
+            )
+
     def _check_agreement(self, write: ResolvedGraphWrite, stored: Entity) -> None:
         """What is already in the graph decides, not what the command claims."""
         if stored.owner_id != write.owner_id:
@@ -319,6 +376,12 @@ class GraphWriteService:
         Sensitivity comes from the entity, not from the payload's shape. An
         event about an S3 record stays S3 even though it carries only a
         reference: what a mutation is *about* is itself something to withhold.
+
+        Provenance travels without its prose. ``SourceRef.detail`` is free text
+        written when the fact was captured and is frequently her own words; a
+        durable event needs to name where a fact came from, not to keep a second
+        copy of what she said. The canonical entity is untouched — only the
+        announcement is narrowed.
         """
         resolution = resolve_graph_event(
             operation=write.intent.operation, entity=entity, previous=previous
@@ -328,7 +391,7 @@ class GraphWriteService:
             payload=resolution.payload,
             actor=Actor.agent_actor(write.proposed_by, entity.owner_id),
             subject=Subject(owner_id=entity.owner_id, entity_id=entity.id),
-            source=entity.attribution.source,
+            source=entity.attribution.source.without_free_text(),
             sensitivity=entity.attribution.sensitivity,
             occurred_at=at,
             correlation_id=correlation_id,
