@@ -6,11 +6,13 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
 from wplos.integration.specs import IntegrationEventType
+from wplos.integration.sqlite_support import connect, now_iso, parse_dt
+from wplos.integration.sqlite_support import transaction as write_transaction
 from wplos.policy.execution import ExecutionAuthorization, ProposedAction
 
 
@@ -192,9 +194,7 @@ class ProjectionState:
 
 
 def _dt(value: str | None) -> datetime | None:
-    if value is None:
-        return None
-    return datetime.fromisoformat(value)
+    return parse_dt(value)
 
 
 def _placeholders(values: frozenset[ActionStatus]) -> str:
@@ -202,7 +202,7 @@ def _placeholders(values: frozenset[ActionStatus]) -> str:
 
 
 def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return now_iso()
 
 
 class SQLiteIntegrationStore:
@@ -213,11 +213,7 @@ class SQLiteIntegrationStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10.0, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=10000")
-        return connection
+        return connect(self.path)
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -288,16 +284,8 @@ class SQLiteIntegrationStore:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+        with write_transaction(self.path) as connection:
             yield connection
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
 
     def next_aggregate_version(self, connection: sqlite3.Connection, aggregate_id: str) -> int:
         row = connection.execute(

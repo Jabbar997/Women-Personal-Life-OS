@@ -34,6 +34,7 @@ from wplos.application.trace import (
     ScopeTrace,
     TraceStep,
 )
+from wplos.application.writes import SanctionedWrite
 from wplos.core.identifiers import ActionId
 from wplos.core.provenance import SourceRef, SourceType
 from wplos.core.purpose import Purpose
@@ -255,6 +256,7 @@ class OrchestratorRuntime:
             status=_status(composed, authorizations, failures, guardian_failed),
             plan=composed,
             emitted_events=events,
+            sanctioned_writes=_sanctioned_writes(outputs),
             failures=tuple(failures),
             warnings=_warnings(failures, guardian_failed),
             trace=trace,
@@ -449,6 +451,19 @@ class OrchestratorRuntime:
 def _assessments(outputs: dict[AgentName, AgentOutput]) -> tuple[GuardianAssessment, ...]:
     guardian = outputs.get(AgentName.GUARDIAN)
     return () if guardian is None else guardian.assessments
+
+
+def _sanctioned_writes(outputs: dict[AgentName, AgentOutput]) -> tuple[SanctionedWrite, ...]:
+    """What the minds asked to change, in the order they were asked.
+
+    Every output here has already been through ``enforce_output``, so a write
+    outside a contract never reaches this point — it stopped the run instead.
+    """
+    return tuple(
+        SanctionedWrite(agent=agent, intent=intent)
+        for agent, output in outputs.items()
+        for intent in output.writes
+    )
 
 
 def _proposals_so_far(outputs: dict[AgentName, AgentOutput]) -> tuple[ProposedAction, ...]:

@@ -14,6 +14,7 @@ from wplos.core.identifiers import (
     RequestId,
 )
 from wplos.core.provenance import SourceType
+from wplos.core.records import RecordStatus
 from wplos.core.roles import AgentName
 from wplos.core.temporal import ensure_utc
 from wplos.events.types import EventType
@@ -47,6 +48,22 @@ class EntityRefPayload(EventPayload):
 
 class UserProfileUpdatedPayload(EventPayload):
     changed_fields: tuple[str, ...]
+
+
+class GraphMutationPayload(EventPayload):
+    """A graph entity changed, said in the fewest facts that identify the change.
+
+    Used where the catalog has no event that names this particular mutation. It
+    carries a reference and a version, never content: a consumer that needs what
+    the entity says reads it through ``project_context`` under its own
+    clearance, which is what keeps an event stream from becoming a second,
+    unclassified copy of the graph.
+    """
+
+    entity_id: EntityId
+    entity_type: EntityType
+    revision: int = Field(ge=1)
+    status: RecordStatus
 
 
 class GoalProgressUpdatedPayload(EventPayload):
@@ -390,6 +407,9 @@ class OperatorOutcomeUnknownPayload(EventPayload):
 
 PAYLOAD_BY_EVENT: dict[EventType, type[EventPayload]] = {
     EventType.USER_PROFILE_UPDATED: UserProfileUpdatedPayload,
+    EventType.GRAPH_ENTITY_CREATED: GraphMutationPayload,
+    EventType.GRAPH_ENTITY_REVISED: GraphMutationPayload,
+    EventType.GRAPH_ENTITY_CLOSED: GraphMutationPayload,
     EventType.GOAL_CREATED: EntityRefPayload,
     EventType.GOAL_UPDATED: EntityRefPayload,
     EventType.GOAL_PROGRESS_UPDATED: GoalProgressUpdatedPayload,

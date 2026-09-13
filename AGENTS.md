@@ -19,13 +19,15 @@ never sees the routing.
 
 ## 2. Current phase
 
-**Phase 04 — Orchestrator Runtime.** The domain core plus an executable
-decision runtime in `src/wplos/application/`. Six deterministic reference minds
-prove the machinery; no model is connected to anything. Two validation passes have run against it: a ten-scenario life
-simulation (`docs/validation/foundation-validation-01.md`) and thirty
-adversarial scenarios plus mobile readiness
-(`docs/validation/adversarial-validation-v3.md`). Seven critical gaps were found
-across the two and all are closed. The Orchestrator runtime has not started.
+**Phase 05 — Persistent GraphWrite.** The domain core, the decision runtime,
+the Integration Kernel, and now a durable Personal Life Graph: a sanctioned
+`GraphWriteIntent` becomes a typed mutation and its domain event, committed
+together, and still there after a restart. Six deterministic reference minds
+prove the machinery; no model is connected to anything. Two validation passes
+have run against the foundation: a ten-scenario life simulation
+(`docs/validation/foundation-validation-01.md`) and thirty adversarial scenarios
+plus mobile readiness (`docs/validation/adversarial-validation-v3.md`). Seven
+critical gaps were found across the two and all are closed.
 
 **The product is a native-feeling iOS and Android application**, with Flutter
 the likely client. No client code exists and none belongs here: the domain runs
@@ -49,6 +51,13 @@ Already built:
   contract enforcement, conflict and priority resolution, the Action Composer
   with a budget and typed suppression, authorization routing and a runtime
   trace.
+- The Integration Kernel: a transactional outbox, DB-enforced idempotency,
+  per-aggregate ordering, consumer offsets, projection staleness and an atomic
+  processing claim, on stdlib `sqlite3`.
+- Durable graph writes: `ResolvedGraphWrite`, the `GraphWriteService`, an
+  append-only SQLite entity store that reconstructs canonical `Entity` models,
+  graph mutation events in the same transaction, batch atomicity and
+  request-level idempotency. See `docs/runtime/graph-write.md`.
 
 Deliberately **not** built yet, and not to be added without a new ADR:
 
@@ -61,6 +70,13 @@ Deliberately **not** built yet, and not to be added without a new ADR:
 - An offline sync engine, a push provider, deep-link routing, or precomputed
   Today projections. The architecture must *permit* them; it must not assume
   them, and it must not assume a device is reachable at the moment of an action.
+- A resolver that turns a phrase into a typed entity. `GraphWriteResolver` is a
+  port; nothing in `src/` implements it, and Universal Capture is a later phase.
+- Projections over the graph outbox. Events are durable and observable; nothing
+  subscribes yet.
+- Durable relationships or memory records. Only entities are persisted.
+- Schema migrations. `Entity.model_dump_json` is part of the storage contract
+  now, and the first change to a stored attributes model needs a migration path.
 - Any LLM provider integration, DeepSeek included.
 - Authentication, payments, a marketplace, an autonomous agent loop.
 - A vector database, a graph database, Kafka, Redis, microservices.
@@ -137,8 +153,10 @@ them.
 - Do not add a dependency without an ADR. Runtime dependencies are pydantic and
   nothing else.
 - Imports point one way only:
-  `shared -> core -> policy -> personal_life_graph -> events -> agents -> orchestration -> application`.
-  A test enforces this. `application/` is the runtime; the domain never imports it.
+  `shared -> core -> policy -> personal_life_graph -> events -> agents -> orchestration -> application -> integration`.
+  A test enforces this. `application/` is the runtime and the domain never
+  imports it; `integration/` is the outermost layer, holds every adapter, and
+  nothing below it may reach into sqlite, an outbox or a worker.
 - Domain model, API contract and mobile view model stay three separate things.
   `ComposedActionPlan` is an application model, not a screen.
 
@@ -205,6 +223,12 @@ them.
 - Passing the gate an action a client sent back instead of one the server just
   derived.
 - Writing a record over another without checking its `revision`.
+- Persisting a simplified copy of an entity beside the canonical one. Storage
+  may serialize a record; it may not define a second, weaker shape of it.
+- Committing a graph mutation without the event announcing it, in the same
+  transaction.
+- Giving a mind a handle to a mutable graph. Minds propose writes; the
+  application layer decides whether the graph accepts them.
 - Putting business reasoning in the Orchestrator. It routes, coordinates,
   enforces, composes and records; it holds no opinion about a life.
 - Letting the Orchestrator write to the graph, or a mind write outside its
@@ -226,6 +250,8 @@ them.
 | Agent authority | `docs/domain/agent-authority-matrix.md` (generated) |
 | Agent handoffs | `docs/domain/agent-handoffs.md` |
 | Runtime | `docs/runtime/orchestrator-runtime.md`, `routing.md`, `action-composer.md`, `failure-policy.md` |
+| Integration kernel | `docs/runtime/integration-kernel.md` |
+| Durable graph writes | `docs/runtime/graph-write.md` |
 | Validation | `docs/validation/foundation-validation-01.md`, `docs/validation/adversarial-validation-v3.md` |
 | Decisions | `docs/adr/` |
 
@@ -234,4 +260,5 @@ them.
 The domain is shaped to serve a mobile app, a REST or GraphQL API, background
 jobs, an AI gateway, connectors, calendar integrations, Radar sources and
 Operator actions. None of them are built yet. Adding one is a new phase with its
-own ADR, not an incidental commit.
+own ADR, not an incidental commit. Universal Capture — the first thing that will
+need a real `GraphWriteResolver` — waits until Phase 05 is accepted and merged.

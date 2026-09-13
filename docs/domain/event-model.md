@@ -61,12 +61,18 @@ Reused shapes keep the catalog small: `EntityRefPayload` for simple
 created/updated events, `OpenLoopPayload` for tasks and commitments,
 `OperatorActionResultPayload` for the Operator's lifecycle outcomes.
 
+`GraphMutationPayload` carries `entity_id`, `entity_type`, `revision` and
+`status` — a reference and a version, never content. A consumer that needs what
+the entity says reads it through `project_context` under its own clearance,
+which is what keeps an event stream from becoming a second, unclassified copy
+of the graph.
+
 ## 4. Catalog
 
-Profile · Goals · Commitments · Tasks · Deadlines · Calendar events · Calendar
-conflict · Capture · Memory · Recommendations · Preference and behaviour ·
-Purchases and return windows · Products · Wardrobe · Cycle · Mood, energy,
-sleep · Weather · Radar · Guardian · Readiness · Operator.
+Profile · Graph mutations · Goals · Commitments · Tasks · Deadlines · Calendar
+events · Calendar conflict · Capture · Memory · Recommendations · Preference and
+behaviour · Purchases and return windows · Products · Wardrobe · Cycle · Mood,
+energy, sleep · Weather · Radar · Guardian · Readiness · Operator.
 
 The recommendation lifecycle exists because behavioural learning needs the raw
 signal:
@@ -97,7 +103,23 @@ OPERATOR_ACTION_REVERSED
 The full list lives in `src/wplos/events/types.py` and is the single source of
 truth.
 
-## 5. Bus
+## 5. Announcing a graph mutation
+
+`GRAPH_ENTITY_CREATED`, `GRAPH_ENTITY_REVISED` and `GRAPH_ENTITY_CLOSED` exist
+for changes the catalog does not otherwise name. They are a fallback, not a
+default: where an event already names the mutation — `COMMITMENT_CAPTURED` for a
+new commitment, `EVENT_CANCELLED` for a closed calendar event — that event is
+used, because two vocabularies for one fact means consumers subscribed to the
+wrong one.
+
+Equally, an event that means something else is never borrowed to avoid adding
+the right one. `PRODUCT_LOW` is a rules observation about stock, not a statement
+that a product record was revised, so a `PRODUCT` revision falls back rather
+than pretending to be a detection. The mapping and its two rules live in
+`application/graph_events.py`; the write path that uses it is documented in
+`docs/runtime/graph-write.md`.
+
+## 6. Bus
 
 `EventBus` is the port a real broker would implement later.
 `InMemoryEventBus` is an append-only log with synchronous fan-out. It refuses to

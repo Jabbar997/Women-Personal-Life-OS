@@ -9,6 +9,7 @@ from wplos.application.composer import (
 )
 from wplos.application.failure import AgentFailure
 from wplos.application.trace import RuntimeTrace
+from wplos.application.writes import SanctionedWrite
 from wplos.core.identifiers import CorrelationId, RequestId
 from wplos.events.envelope import DomainEvent
 
@@ -47,6 +48,13 @@ class RuntimeResult(BaseModel):
     status: RuntimeStatus
     plan: ComposedActionPlan = Field(default_factory=ComposedActionPlan)
     emitted_events: tuple[DomainEvent, ...] = Field(default_factory=tuple)
+    sanctioned_writes: tuple[SanctionedWrite, ...] = Field(default_factory=tuple)
+    """Graph changes the minds asked for, after ``enforce_output`` allowed them.
+
+    The runtime does not apply them. It reports them, in the structured form the
+    contracts were checked against, so the GraphWrite service never has to guess
+    a write out of composed prose.
+    """
     failures: tuple[AgentFailure, ...] = Field(default_factory=tuple)
     warnings: tuple[RuntimeWarning, ...] = Field(default_factory=tuple)
     trace: RuntimeTrace = Field(default_factory=RuntimeTrace)

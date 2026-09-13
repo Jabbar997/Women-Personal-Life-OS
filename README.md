@@ -6,11 +6,14 @@ minds and an orchestrator on the inside.
 It is not a period tracker, a beauty app, a planner, a deals app, a generic AI
 chatbot, or a super-app stitched together from separate features.
 
-> **Current phase: Orchestrator Runtime.**
+> **Current phase: Persistent GraphWrite.**
 > The domain core — Personal Life Graph, event model, agent contracts, policy
 > primitives — plus an executable decision runtime that coordinates the six
-> minds. Six deterministic reference minds prove the machinery works; no model
-> is connected. There is no UI, no API and no database yet, by design.
+> minds, an integration kernel for external actions, and a durable graph: a
+> sanctioned write becomes a typed mutation and its domain event, committed
+> together, and still there after a restart. Six deterministic reference minds
+> prove the machinery works; no model is connected. There is no UI and no API
+> yet, by design.
 >
 > The product is a native-feeling iOS and Android application. The client is not
 > built yet, and when it is, it will be a presentation and cache layer: the
