@@ -153,10 +153,13 @@ them.
 - Do not add a dependency without an ADR. Runtime dependencies are pydantic and
   nothing else.
 - Imports point one way only:
-  `shared -> core -> policy -> personal_life_graph -> events -> agents -> orchestration -> application -> integration`.
+  `shared -> core -> policy -> personal_life_graph -> events -> agents -> orchestration -> application -> integration -> governance`.
   A test enforces this. `application/` is the runtime and the domain never
-  imports it; `integration/` is the outermost layer, holds every adapter, and
-  nothing below it may reach into sqlite, an outbox or a worker.
+  imports it; `integration/` holds every adapter, and nothing below it may reach
+  into sqlite, an outbox or a worker. `governance/` is ranked outermost because
+  it describes the system and is never part of it: it imports nothing from
+  `wplos`, nothing in `wplos` may import it, and a declaration there can never
+  change what the runtime does.
 - Domain model, API contract and mobile view model stay three separate things.
   `ComposedActionPlan` is an application model, not a screen.
 
@@ -191,6 +194,15 @@ them.
   a test. `tests/test_architecture_boundaries.py` is the pattern.
 - Nothing is deleted in this system, so tests must assert that history survives
   an expiry or a revision.
+- Every production module carries one classification in
+  `src/wplos/governance/registry.py`: `REACHABLE`, `INTERNAL_ONLY` or `DELETE`.
+  Adding a module without classifying it fails the suite, and so does claiming a
+  reachability the import graph does not support. `INTERNAL_ONLY` needs a
+  canonical owner, a reason, a named future consumer, a phase it expires after
+  and a reviewer approval citing a document in this repository; it expires on
+  its own. Every critical concept has exactly one canonical owner, and every
+  governed output has a production consumer or an approved reason for having
+  none. A test is never a production consumer.
 - Run `./scripts/check.sh` before every push: format, lint, types, tests.
 
 ## 8. Security and privacy rules
@@ -260,6 +272,7 @@ them.
 | Runtime | `docs/runtime/orchestrator-runtime.md`, `routing.md`, `action-composer.md`, `failure-policy.md` |
 | Integration kernel | `docs/runtime/integration-kernel.md` |
 | Durable graph writes | `docs/runtime/graph-write.md` |
+| Governance | `src/wplos/governance/registry.py` (executable; read by `tests/test_governance.py`) |
 | Validation | `docs/validation/foundation-validation-01.md`, `docs/validation/adversarial-validation-v3.md` |
 | Decisions | `docs/adr/` |
 

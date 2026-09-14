@@ -50,6 +50,7 @@ LAYERS: dict[str, int] = {
     "orchestration": 6,
     "application": 7,
     "integration": 8,
+    "governance": 9,
 }
 
 
@@ -128,6 +129,29 @@ def test_nothing_below_integration_may_import_it() -> None:
         if layer is None or layer == "integration":
             continue
         if "integration" in _wplos_imports(module):
+            offenders.append(relative.as_posix())
+
+    assert not offenders, offenders
+
+
+def test_nothing_imports_the_governance_layer() -> None:
+    """Governance describes the system. It is never part of it.
+
+    It is ranked outermost so the one-way rule covers it at all — without a rank
+    the layering test skips a package silently — and outermost means production
+    code that imported it would be importing upwards. A governance declaration
+    that could change runtime behaviour would stop being a description and start
+    being a dependency nobody asked for.
+    """
+    assert LAYERS["governance"] > LAYERS["integration"]
+
+    offenders: list[str] = []
+    for module in _modules():
+        relative = module.relative_to(SRC)
+        layer = relative.parts[0] if len(relative.parts) > 1 else None
+        if layer is None or layer == "governance":
+            continue
+        if "governance" in _wplos_imports(module):
             offenders.append(relative.as_posix())
 
     assert not offenders, offenders
